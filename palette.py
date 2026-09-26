@@ -49,7 +49,7 @@ class CommandPalette:
         self.win = tk.Toplevel(parent)
         self.win.title("keytap — launch app")
         self.win.configure(bg=self.BG)
-        self.win.resizable(False, False)
+        self.win.resizable(True, True)
 
         px, py = parent.winfo_x(), parent.winfo_y()
         pw, ph = parent.winfo_width(), parent.winfo_height()
@@ -282,7 +282,6 @@ class CommandPalette:
         self._state = "viewer"
         self._entry.config(state="normal")
         self._var.set("")
-        self.win.resizable(True, True)
         self.win.geometry(f"750x{self.H}")
         self._filter_viewer("")
         self._entry.focus_set()
@@ -313,7 +312,6 @@ class CommandPalette:
             self._listbox.see(idx)
 
     def _back_to_actions(self):
-        self.win.resizable(False, False)
         self.win.geometry(f"{self.W}x{self.H}")
         self._show_actions(self._selected_pkg)
 
@@ -355,7 +353,6 @@ class CommandPalette:
                 self._hier_show_level()
             else:
                 self._hier_clear_hover()
-                self.win.resizable(False, False)
                 self.win.geometry(f"{self.W}x{self.H}")
                 self._back_to_search()
         elif self._state == "viewer":
@@ -392,7 +389,6 @@ class CommandPalette:
         self._state = "hierarchy"
         self._entry.config(state="normal")
         self._var.set("")
-        self.win.resizable(True, True)
         self.win.geometry(f"750x{self.H}")
         self._hier_show_level()
         self._entry.focus_set()
@@ -463,7 +459,6 @@ class CommandPalette:
     def _mem_enter(self):
         self._state = "memory"
         self._entry.config(state="disabled")
-        self.win.resizable(True, True)
         self.win.geometry(f"620x480")
         self._listbox.pack_forget()
         self._mem_canvas.pack(fill="both", expand=True)
@@ -482,7 +477,6 @@ class CommandPalette:
         self._mem_stop_poll()
         self._mem_canvas.pack_forget()
         self._listbox.pack(fill="both", expand=True)
-        self.win.resizable(False, False)
         self.win.geometry(f"{self.W}x{self.H}")
         self._back_to_search()
 
