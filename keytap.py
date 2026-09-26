@@ -42,8 +42,8 @@ HAS_FFMPEG = shutil.which("ffmpeg") is not None
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--serial", default=None, help="ADB serial (e.g. emulator-5554)")
-    p.add_argument("--cols",   type=int, default=6)
-    p.add_argument("--rows",   type=int, default=10)
+    p.add_argument("--cols",   type=int, default=10)
+    p.add_argument("--rows",   type=int, default=16)
     p.add_argument("--height", type=int, default=800, help="mirror window height px")
     return p.parse_args()
 
@@ -166,34 +166,44 @@ class KeyTap:
                 label = f"{row_letter}{string.ascii_uppercase[c]}"
 
                 if not typed:
-                    # Idle: faint lines only, no labels
+                    # Idle: faint lines + dim pills always visible
                     draw.rectangle([x0, y0, x1 - 1, y1 - 1],
                                    outline=(255, 255, 255, 38))
+                    self._draw_pill(draw, x0, y0, label, active=False)
                 elif row_match:
-                    # Active row: bright lines + gold band + pill label
+                    # Active row: gold band + bright lines + bright pill
                     draw.rectangle([x0, y0, x1, y1], fill=(255, 215, 0, 28))
                     draw.rectangle([x0, y0, x1 - 1, y1 - 1],
                                    outline=(255, 215, 0, 200))
                     self._draw_pill(draw, x0, y0, label, active=True)
                 else:
-                    # Inactive rows while typing: very faint
+                    # Inactive rows while typing: very faint lines + ghost pills
                     draw.rectangle([x0, y0, x1 - 1, y1 - 1],
-                                   outline=(255, 255, 255, 18))
+                                   outline=(255, 255, 255, 15))
+                    self._draw_pill(draw, x0, y0, label, active=None)
 
         return Image.alpha_composite(base, overlay).convert("RGB")
 
     def _draw_pill(self, draw, x0, y0, label, active=False):
-        """Draw a small pill badge with label text in the top-left corner of a cell."""
+        """Draw a pill badge in top-left corner. active=True: bright, False: dim, None: ghost."""
         pad = 3
         try:
             bbox = self._grid_font.getbbox(label)
             tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
         except AttributeError:
-            tw, th = len(label) * 7, 10  # fallback for old Pillow
+            tw, th = len(label) * 7, 10
         px0, py0 = x0 + 3, y0 + 3
         px1, py1 = px0 + tw + pad * 2, py0 + th + pad * 2
-        draw.rectangle([px0, py0, px1, py1], fill=(0, 0, 0, 185))
-        color = (0, 255, 110, 255) if active else (0, 210, 80, 200)
+        if active is True:
+            bg    = (0, 0, 0, 200)
+            color = (0, 255, 110, 255)
+        elif active is False:
+            bg    = (0, 0, 0, 140)
+            color = (0, 200, 75, 180)
+        else:  # ghost: typing but not this row
+            bg    = (0, 0, 0, 70)
+            color = (0, 150, 55, 90)
+        draw.rectangle([px0, py0, px1, py1], fill=bg)
         draw.text((px0 + pad, py0 + pad), label, fill=color, font=self._grid_font)
 
     def redraw(self):
