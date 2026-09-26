@@ -15,10 +15,13 @@ class CommandPalette:
     SEL_BG = "#3a3a3c"
 
     ACTIONS = [
-        ("  Launch",      "launch"),
-        ("  Force Stop",  "force-stop"),
-        ("  Clear Data",  "clear-data"),
-        ("  Uninstall",   "uninstall"),
+        ("  Launch",        "launch"),
+        ("  Force Stop",    "force-stop"),
+        ("  Clear Data",    "clear-data"),
+        ("  Uninstall",     "uninstall"),
+        ("  Shared Prefs",  "shared-prefs"),
+        ("  Remote Config", "remote-config"),
+        ("  Litmus",        "litmus"),
     ]
 
     def __init__(self, parent, packages, on_action, clipboard_text="", deeplink_history=None):
@@ -53,7 +56,7 @@ class CommandPalette:
         tk.Label(row, text=">", bg=self.BG_IN, fg=self.FG_DIM,
                  font=("Menlo", 13)).pack(side="left", padx=(8, 4))
         self._var = tk.StringVar()
-        self._var.trace_add("write", lambda *_: self._filter(self._var.get()))
+        self._var.trace_add("write", lambda *_: self._on_query_change())
         self._entry = tk.Entry(
             row, textvariable=self._var,
             bg=self.BG_IN, fg=self.FG, insertbackground=self.FG,
@@ -83,6 +86,12 @@ class CommandPalette:
             w.bind("<Escape>", self._on_esc)
         self._listbox.bind("<Double-Button-1>", self._select)
         self.win.bind("<Escape>", self._on_esc)
+
+    def _on_query_change(self):
+        if self._state == "viewer":
+            self._filter_viewer(self._var.get())
+        else:
+            self._filter(self._var.get())
 
     def _filter(self, query):
         q  = query.strip()
@@ -138,6 +147,13 @@ class CommandPalette:
         return "break"
 
     def _select(self, _e=None):
+        if self._state == "viewer":
+            if self._viewer_on_select:
+                cur = self._listbox.curselection()
+                if cur:
+                    key, value = self._viewer_shown[cur[0]]
+                    self._viewer_on_select(key, value)
+            return "break"
         if self._state == "search":
             cur = self._listbox.curselection()
             if not cur:
@@ -181,11 +197,55 @@ class CommandPalette:
         if not cur:
             return
         _, action = self.ACTIONS[cur[0]]
-        self._on_action(self._selected_pkg, action)
-        self._close()
+        if action in ("shared-prefs", "remote-config", "litmus"):
+            self._enter_loading(action)
+            self._on_action(self._selected_pkg, action)
+        else:
+            self._on_action(self._selected_pkg, action)
+            self._close()
+
+    def _enter_loading(self, label):
+        self._state = "viewer"
+        self._listbox.delete(0, tk.END)
+        self._listbox.insert(tk.END, "  loading...")
+        self._footer.set(f"{label} — fetching from device...")
+
+    def show_viewer(self, title, items, on_select=None):
+        """Called from app after data is fetched. items = [(key, value), ...]"""
+        self._viewer_items    = items
+        self._viewer_title    = title
+        self._viewer_on_select = on_select
+        self._viewer_shown    = []
+        self._state = "viewer"
+        self._entry.config(state="normal")
+        self._var.set("")
+        self.win.resizable(True, True)
+        self.win.geometry(f"750x{self.H}")
+        self._filter_viewer("")
+        self._entry.focus_set()
+
+    def _filter_viewer(self, query):
+        ql = query.strip().lower()
+        self._viewer_shown = [
+            (k, v) for k, v in self._viewer_items
+            if not ql or ql in k.lower() or ql in str(v).lower()
+        ]
+        self._listbox.delete(0, tk.END)
+        for k, v in self._viewer_shown:
+            self._listbox.insert(tk.END, f"  {k}  =  {v}")
+        hint = "  Enter=expand" if self._viewer_on_select else ""
+        n = len(self._viewer_shown)
+        self._footer.set(f"{self._viewer_title} — {n} keys  |  type to search{hint}  Esc=back")
+
+    def _back_to_actions(self):
+        self.win.resizable(False, False)
+        self.win.geometry(f"{self.W}x{self.H}")
+        self._show_actions(self._selected_pkg)
 
     def _on_esc(self, _e=None):
-        if self._state == "actions":
+        if self._state == "viewer":
+            self._back_to_actions()
+        elif self._state == "actions":
             self._back_to_search()
         else:
             self._close()
