@@ -42,8 +42,8 @@ HAS_FFMPEG = shutil.which("ffmpeg") is not None
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--serial", default=None, help="ADB serial (e.g. emulator-5554)")
-    p.add_argument("--cols",   type=int, default=10)
-    p.add_argument("--rows",   type=int, default=20)
+    p.add_argument("--cols",   type=int, default=6)
+    p.add_argument("--rows",   type=int, default=10)
     p.add_argument("--height", type=int, default=800, help="mirror window height px")
     return p.parse_args()
 
@@ -132,7 +132,7 @@ class KeyTap:
     def _load_grid_font(self):
         if not HAS_PIL:
             return None
-        fs = max(9, int(min(self.win_w / ARGS.cols, self.win_h / ARGS.rows) // 4))
+        fs = max(8, int(min(self.win_w / ARGS.cols, self.win_h / ARGS.rows) // 5))
         for path in [
             "/System/Library/Fonts/Menlo.ttc",
             "/System/Library/Fonts/Monaco.ttf",
@@ -145,7 +145,7 @@ class KeyTap:
         return ImageFont.load_default()
 
     def _composite_grid(self, frame):
-        """Composite 50%-opacity grid onto a PIL Image, return new PIL Image."""
+        """Progressive-reveal grid overlay composited onto a PIL Image."""
         base = frame.convert("RGBA")
         overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
@@ -154,26 +154,47 @@ class KeyTap:
         cw = W / ARGS.cols
         ch = H / ARGS.rows
         typed = ''.join(self.input_buf).upper()
-        ALPHA = 128  # 50%
+        row_selected = len(typed) == 1
 
         for r in range(ARGS.rows):
+            row_letter = string.ascii_uppercase[r]
+            row_match = row_selected and row_letter == typed[0]
+
             for c in range(ARGS.cols):
                 x0, y0 = int(c * cw), int(r * ch)
                 x1, y1 = int((c + 1) * cw), int((r + 1) * ch)
-                cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
-                label = f"{string.ascii_uppercase[r]}{string.ascii_uppercase[c]}"
-                active = bool(typed and label.startswith(typed))
+                label = f"{row_letter}{string.ascii_uppercase[c]}"
 
-                line_rgba  = (255, 215, 0, ALPHA) if active else (255, 255, 255, ALPHA)
-                label_rgba = (0, 255, 100, 230)    if active else (0, 210, 80, ALPHA)
-
-                draw.rectangle([x0, y0, x1 - 1, y1 - 1], outline=line_rgba)
-                draw.text((cx + 1, cy + 1), label, fill=(0, 0, 0, ALPHA),
-                          font=self._grid_font, anchor="mm")
-                draw.text((cx, cy), label, fill=label_rgba,
-                          font=self._grid_font, anchor="mm")
+                if not typed:
+                    # Idle: faint lines only, no labels
+                    draw.rectangle([x0, y0, x1 - 1, y1 - 1],
+                                   outline=(255, 255, 255, 38))
+                elif row_match:
+                    # Active row: bright lines + gold band + pill label
+                    draw.rectangle([x0, y0, x1, y1], fill=(255, 215, 0, 28))
+                    draw.rectangle([x0, y0, x1 - 1, y1 - 1],
+                                   outline=(255, 215, 0, 200))
+                    self._draw_pill(draw, x0, y0, label, active=True)
+                else:
+                    # Inactive rows while typing: very faint
+                    draw.rectangle([x0, y0, x1 - 1, y1 - 1],
+                                   outline=(255, 255, 255, 18))
 
         return Image.alpha_composite(base, overlay).convert("RGB")
+
+    def _draw_pill(self, draw, x0, y0, label, active=False):
+        """Draw a small pill badge with label text in the top-left corner of a cell."""
+        pad = 3
+        try:
+            bbox = self._grid_font.getbbox(label)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        except AttributeError:
+            tw, th = len(label) * 7, 10  # fallback for old Pillow
+        px0, py0 = x0 + 3, y0 + 3
+        px1, py1 = px0 + tw + pad * 2, py0 + th + pad * 2
+        draw.rectangle([px0, py0, px1, py1], fill=(0, 0, 0, 185))
+        color = (0, 255, 110, 255) if active else (0, 210, 80, 200)
+        draw.text((px0 + pad, py0 + pad), label, fill=color, font=self._grid_font)
 
     def redraw(self):
         if self._raw_frame is not None:
@@ -323,10 +344,12 @@ class KeyTap:
 
     def _idle_status(self):
         buf = ''.join(self.input_buf).upper()
-        if buf:
-            self.status(f"typing: {buf}_  (Backspace=clear)")
+        cols_range = string.ascii_uppercase[:ARGS.cols]
+        rows_range = string.ascii_uppercase[:ARGS.rows]
+        if len(buf) == 1:
+            self.status(f"row {buf} selected  →  type col ({cols_range[0]}-{cols_range[-1]})  |  Backspace=cancel")
         else:
-            self.status("type 2-letter label to tap (e.g. AA, BJ, TC)  |  Esc=quit")
+            self.status(f"type row ({rows_range[0]}-{rows_range[-1]}) then col ({cols_range[0]}-{cols_range[-1]})  |  Esc=quit")
 
     # ── Key handler ──────────────────────────────────────────────────────────
 
