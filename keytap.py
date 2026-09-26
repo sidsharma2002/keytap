@@ -29,6 +29,8 @@ import re
 import io
 import queue
 import time
+import os
+import shutil
 
 try:
     from PIL import Image, ImageTk
@@ -36,7 +38,10 @@ try:
 except ImportError:
     HAS_PIL = False
 
-ADB_PATH = "/Users/sidharthsharma/Library/Android/sdk/platform-tools/adb"
+ADB_PATH   = "/Users/sidharthsharma/Library/Android/sdk/platform-tools/adb"
+FIFO_PATH  = "/tmp/keytap_stream.fifo"
+HAS_SCRCPY = shutil.which("scrcpy") is not None
+HAS_FFMPEG = shutil.which("ffmpeg") is not None
 
 
 def parse_args():
@@ -187,8 +192,68 @@ class KeyTap:
 
     # ── Capture pipeline ──────────────────────────────────────────────────────
 
-    def _capture_loop(self):
-        """Background thread: ADB + PIL resize, feeds _frame_q."""
+    def _start_stream(self):
+        """Start scrcpy + ffmpeg pipeline. Falls back to screencap if unavailable."""
+        if HAS_SCRCPY and HAS_FFMPEG:
+            threading.Thread(target=self._scrcpy_stream, daemon=True).start()
+        else:
+            missing = []
+            if not HAS_SCRCPY: missing.append("scrcpy")
+            if not HAS_FFMPEG:  missing.append("ffmpeg")
+            self.root.after(0, lambda: self.status(f"missing {','.join(missing)} - using screencap"))
+            threading.Thread(target=self._screencap_loop, daemon=True).start()
+
+    def _scrcpy_stream(self):
+        """scrcpy → FIFO → ffmpeg → raw RGB24 frames."""
+        # Setup FIFO
+        try:
+            os.unlink(FIFO_PATH)
+        except FileNotFoundError:
+            pass
+        os.mkfifo(FIFO_PATH)
+
+        scrcpy_cmd = ["scrcpy",
+                      "--record", FIFO_PATH,
+                      "--record-format=mkv",
+                      "--no-video-playback",
+                      "--no-audio"]
+        if ARGS.serial:
+            scrcpy_cmd += [f"--serial={ARGS.serial}"]
+
+        ffmpeg_cmd = [
+            "ffmpeg", "-f", "matroska", "-i", FIFO_PATH,
+            "-vf", f"scale={self.win_w}:{self.win_h}",
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"
+        ]
+
+        scrcpy_proc = subprocess.Popen(scrcpy_cmd, stderr=subprocess.DEVNULL)
+        # Small delay so scrcpy connects before ffmpeg opens FIFO
+        time.sleep(1.5)
+        ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+        self._scrcpy_proc = scrcpy_proc
+        self._ffmpeg_proc = ffmpeg_proc
+        self.root.after(0, lambda: self.status("streaming via scrcpy..."))
+
+        frame_size = self.win_w * self.win_h * 3
+        while True:
+            data = ffmpeg_proc.stdout.read(frame_size)
+            if len(data) != frame_size:
+                self.root.after(0, lambda: self.status("stream ended - restarting..."))
+                ffmpeg_proc.wait()
+                scrcpy_proc.wait()
+                time.sleep(1)
+                threading.Thread(target=self._scrcpy_stream, daemon=True).start()
+                return
+            img = Image.frombytes("RGB", (self.win_w, self.win_h), data)
+            try:
+                self._frame_q.get_nowait()
+            except queue.Empty:
+                pass
+            self._frame_q.put(img)
+
+    def _screencap_loop(self):
+        """Fallback: ADB screencap loop."""
         while True:
             try:
                 png = take_screencap()
@@ -199,14 +264,12 @@ class KeyTap:
                         frame = img
                     else:
                         frame = base64.b64encode(png).decode()
-                    # Drop stale frame, keep only latest
                     try:
                         self._frame_q.get_nowait()
                     except queue.Empty:
                         pass
                     self._frame_q.put(frame)
                 else:
-                    self.root.after(0, lambda: self.status("screencap empty"))
                     time.sleep(0.5)
             except Exception as e:
                 self.root.after(0, lambda e=e: self.status(f"capture error: {e}"))
@@ -216,7 +279,9 @@ class KeyTap:
         """Main thread: poll queue at ~60fps, update canvas only when new frame ready."""
         try:
             frame = self._frame_q.get_nowait()
-            if HAS_PIL:
+            if isinstance(frame, Image.Image):
+                self.photo = ImageTk.PhotoImage(frame)
+            elif HAS_PIL:
                 self.photo = ImageTk.PhotoImage(frame)
             else:
                 self.photo = tk.PhotoImage(data=frame)
@@ -364,7 +429,7 @@ class KeyTap:
     # ── Run ──────────────────────────────────────────────────────────────────
 
     def run(self):
-        threading.Thread(target=self._capture_loop, daemon=True).start()
+        self._start_stream()
         self._display_loop()
         self.root.mainloop()
 
