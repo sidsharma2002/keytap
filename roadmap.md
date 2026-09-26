@@ -87,16 +87,64 @@ Pre-defined name → ADB command. Fuzzy match on name.
 
 ---
 
+## uiautomator2 (Element-Aware Mode)
+
+Uses the `uiautomator2` Python library which runs a persistent agent on device. UI hierarchy dump is ~50-200ms vs 500ms+ for `adb shell uiautomator dump`. Enables element-driven tapping instead of coordinate-driven.
+
+### Element overlay (highest value)
+- `e` key → dump hierarchy, parse `bounds="[x1,y1][x2,y2]"` for all interactive elements
+- Draw colored bounding boxes + short labels (`a`, `b`, `c`... or `1`, `2`, `3`) on the mirror
+- Press label → tap that element's center coords
+- Replaces grid for test automation use cases; grid stays for exploratory use
+- Two modes: **grid mode** (current, arbitrary tap anywhere) + **element mode** (real UI targets only)
+
+### Element search in palette
+- Second mode in existing palette: search visible elements by text or resource-id
+- Type "login" → finds `Button[text=Login]` → tap
+- No coordinate guessing; survives layout shifts
+
+### Context-aware status bar
+- On cursor move, check which element is at those device coords from cached hierarchy
+- Show `button: "Sign In" (clickable)` in status bar instead of just cell address
+- Near-free once hierarchy is cached
+
+### Smart text input
+- When `Space` pressed: check if cursor is on `EditText` via hierarchy
+- If yes: auto-prompt for string, use `d.send_keys()` instead of raw `input text`
+- If no: normal tap
+
+### Smart scroll
+- Current: raw swipe at cursor position
+- Better: find scrollable container at cursor coords from hierarchy → `d(scrollable=True).scroll()`
+- More reliable, handles nested scrollable containers
+
+### Wait / assert
+- `wait <text>` → block until element with that text appears on screen
+- Useful for semi-automated test flows: tap → wait for next screen → tap
+
+### Record + replay
+- Record taps as element-based actions (`text=`, `resource-id=`) not raw coordinates
+- Replay survives layout changes and different screen sizes
+- Lightweight macro system without fragile coordinate hardcoding
+
+---
+
 ## Priority Order
 
 1. `Shift+arrow` fast jump — one-liner, massive nav speed improvement ✅
 2. `b` / `h` / `r` device shortcuts — common in mobile testing ✅
 3. `w` / `s` scroll — swipe up/down at cursor position ✅
-4. Command palette — `/` key, fuzzy search over actions + app list
-5. Ghost dot on last tap — immediate visual feedback, eliminates guessing
-6. Long press (`Space` hold)
-7. Text input (`t` key)
-8. Bookmarks + undo history
-9. Grid density toggle (`+` / `-`)
-10. Grid visibility toggle (`o`)
-11. Always-on-top window
+4. Command palette — double-Shift, fuzzy search over packages + actions ✅
+5. u2 element overlay — draw real element bounds on mirror, tap by label
+6. u2 element search in palette — search visible UI elements by text
+7. u2 context status bar — show element info on cursor hover
+8. Ghost dot on last tap — immediate visual feedback, eliminates guessing
+9. Long press (`Space` hold)
+10. Smart text input (`t` key / u2 EditText detection)
+11. Smart scroll (u2 scrollable container detection)
+12. Bookmarks + undo history
+13. Grid density toggle (`+` / `-`)
+14. Grid visibility toggle (`o`)
+15. Always-on-top window
+16. u2 wait/assert
+17. u2 record + replay
