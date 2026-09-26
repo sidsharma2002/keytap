@@ -435,6 +435,7 @@ class KeyTap:
             on_action=self._on_palette_action,
             clipboard_text=self._read_clipboard(),
             deeplink_history=self._deeplink_history,
+            serial=ARGS.serial,
         )
 
     def _on_palette_action(self, pkg, action):

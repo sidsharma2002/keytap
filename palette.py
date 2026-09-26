@@ -1,4 +1,7 @@
+import collections
 import re
+import subprocess
+import threading
 import tkinter as tk
 
 _DEEPLINK_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9+\-.]*://.+')
@@ -25,15 +28,22 @@ class CommandPalette:
         ("  Permissions",   "permissions"),
     ]
 
-    def __init__(self, parent, packages, on_action, clipboard_text="", deeplink_history=None):
+    def __init__(self, parent, packages, on_action, clipboard_text="", deeplink_history=None, serial=None):
         self._packages         = packages
         self._on_action        = on_action
-        self._state            = "search"   # "search" | "actions"
+        self._state            = "search"   # "search" | "actions" | "viewer" | "input" | "hierarchy" | "memory"
         self._selected_pkg     = None
         self._clipboard_text   = clipboard_text
         self._deeplink_history = deeplink_history or []
         self._virtual          = []   # [(display_str, type, value), ...]
         self._pkg_filtered     = list(packages)
+        self._serial           = serial
+        # memory watchdog state
+        self._mem_polling  = False
+        self._mem_stop     = threading.Event()
+        self._mem_data     = {}
+        self._mem_history  = collections.deque(maxlen=60)
+        self._mem_canvas   = None
 
         self.win = tk.Toplevel(parent)
         self.win.title("keytap — launch app")
@@ -67,13 +77,19 @@ class CommandPalette:
 
         tk.Frame(self.win, bg="#3a3a3c", height=1).pack(fill="x")
 
+        self._content_frame = tk.Frame(self.win, bg=self.BG)
+        self._content_frame.pack(fill="both", expand=True, padx=8, pady=4)
+
         self._listbox = tk.Listbox(
-            self.win, bg=self.BG, fg=self.FG,
+            self._content_frame, bg=self.BG, fg=self.FG,
             selectbackground=self.SEL_BG, selectforeground=self.ACCENT,
             relief="flat", bd=0, highlightthickness=0,
             font=("Menlo", 12), activestyle="none", height=13
         )
-        self._listbox.pack(fill="both", expand=True, padx=8, pady=4)
+        self._listbox.pack(fill="both", expand=True)
+
+        self._mem_canvas = tk.Canvas(self._content_frame, bg=self.BG, highlightthickness=0)
+        # not packed until memory state is entered
 
         self._footer = tk.StringVar()
         tk.Label(self.win, textvariable=self._footer,
@@ -113,6 +129,8 @@ class CommandPalette:
         else:
             if not ql or ql in "view hierarchy":
                 self._virtual.append(("  View Hierarchy — browse UI tree", "view-hierarchy", ""))
+            if not ql or ql in "memory watchdog":
+                self._virtual.append(("  Memory Watchdog — live RAM stats", "memory-watchdog", ""))
             if not ql or ql in "input text":
                 self._virtual.append(("  Input Text — type to send to device", "input-text", ""))
             if ql and ql in "clipboard":
@@ -202,6 +220,8 @@ class CommandPalette:
                 elif vtype == "view-hierarchy":
                     self._enter_hierarchy_loading()
                     self._on_action("__view-hierarchy__", "")
+                elif vtype == "memory-watchdog":
+                    self._mem_enter()
                 else:
                     self._on_action(f"__{vtype}__", vvalue)
                     self._close()
@@ -316,10 +336,14 @@ class CommandPalette:
     def _on_ctrl_r(self, _e=None):
         if self._state == "hierarchy":
             self._on_action("__refresh-hierarchy__", "")
+        elif self._state == "memory":
+            self._mem_restart()
         return "break"
 
     def _on_esc(self, _e=None):
-        if self._state == "input":
+        if self._state == "memory":
+            self._mem_exit()
+        elif self._state == "input":
             self._back_to_search()
         elif self._state == "hierarchy":
             if self._var.get():
@@ -430,4 +454,235 @@ class CommandPalette:
 
     def _close(self, _e=None):
         self._hier_clear_hover()
+        self._mem_stop_poll()
         self.win.destroy()
+
+    # ── Memory Watchdog ──────────────────────────────────────────────────────
+
+    def _mem_enter(self):
+        self._state = "memory"
+        self._entry.config(state="disabled")
+        self.win.resizable(True, True)
+        self.win.geometry(f"620x{self.H}")
+        self._listbox.pack_forget()
+        self._mem_canvas.pack(fill="both", expand=True)
+        self._footer.set("Cmd+R=refresh  Esc=exit")
+        self._mem_history.clear()
+        self._mem_data = {}
+        self._mem_canvas.delete("all")
+        self._mem_canvas.create_text(310, 130, text="fetching memory stats...",
+                                     fill=self.FG_DIM, font=("Menlo", 11))
+        self._mem_stop.clear()
+        self._mem_polling = True
+        threading.Thread(target=self._mem_poll_loop, daemon=True).start()
+
+    def _mem_exit(self):
+        self._mem_stop_poll()
+        self._mem_canvas.pack_forget()
+        self._listbox.pack(fill="both", expand=True)
+        self.win.resizable(False, False)
+        self.win.geometry(f"{self.W}x{self.H}")
+        self._back_to_search()
+
+    def _mem_stop_poll(self):
+        self._mem_polling = False
+        self._mem_stop.set()
+
+    def _mem_restart(self):
+        self._mem_stop_poll()
+        self._mem_history.clear()
+        self._mem_data = {}
+        self._mem_canvas.delete("all")
+        self._mem_canvas.create_text(310, 130, text="refreshing...",
+                                     fill=self.FG_DIM, font=("Menlo", 11))
+        self._mem_stop.clear()
+        self._mem_polling = True
+        threading.Thread(target=self._mem_poll_loop, daemon=True).start()
+
+    def _mem_poll_loop(self):
+        u2_dev = None
+        try:
+            import uiautomator2 as u2
+            u2_dev = u2.connect(self._serial) if self._serial else u2.connect()
+        except Exception:
+            pass
+
+        while not self._mem_stop.is_set():
+            data = self._mem_fetch(u2_dev)
+            self._mem_data = data
+            if data.get('used_pct') is not None:
+                self._mem_history.append(data['used_pct'])
+            try:
+                self.win.after(0, self._mem_draw)
+            except Exception:
+                break
+            self._mem_stop.wait(2.0)
+
+    def _mem_fetch(self, u2_dev=None):
+        try:
+            # System memory
+            sys_out = self._adb_shell_cmd('cat /proc/meminfo', u2_dev)
+            meminfo = {}
+            for line in sys_out.splitlines():
+                if ':' in line:
+                    k, v = line.split(':', 1)
+                    nums = re.findall(r'\d+', v)
+                    if nums:
+                        meminfo[k.strip()] = int(nums[0])
+            total_kb = meminfo.get('MemTotal', 0)
+            avail_kb = meminfo.get('MemAvailable', meminfo.get('MemFree', 0))
+            used_kb  = max(0, total_kb - avail_kb)
+            used_pct = (used_kb / total_kb * 100) if total_kb else 0.0
+
+            data = {
+                'total_mb': total_kb // 1024,
+                'avail_mb': avail_kb // 1024,
+                'used_mb':  used_kb  // 1024,
+                'used_pct': used_pct,
+                'app_pkg':  '',
+                'app_pss_mb': 0,
+                'error': None,
+            }
+
+            # Foreground app
+            fg_out = self._adb_shell_cmd('dumpsys window | grep mCurrentFocus', u2_dev)
+            m = re.search(r'u\d+\s+([\w.]+)/', fg_out)
+            if m:
+                pkg = m.group(1)
+                data['app_pkg'] = pkg
+                pss_out = self._adb_shell_cmd(f'dumpsys meminfo {pkg}', u2_dev)
+                data['app_pss_mb'] = self._parse_pss(pss_out)
+
+            return data
+        except Exception as e:
+            return {
+                'error': str(e), 'total_mb': 0, 'avail_mb': 0,
+                'used_mb': 0, 'used_pct': 0.0, 'app_pkg': '', 'app_pss_mb': 0,
+            }
+
+    def _adb_shell_cmd(self, cmd, u2_dev=None):
+        if u2_dev:
+            try:
+                result = u2_dev.shell(cmd)
+                return result.output if hasattr(result, 'output') else str(result)
+            except Exception:
+                pass
+        args = ['adb']
+        if self._serial:
+            args += ['-s', self._serial]
+        args += ['shell', cmd]
+        try:
+            result = subprocess.run(args, capture_output=True, text=True, timeout=10)
+            return result.stdout
+        except Exception:
+            return ''
+
+    def _parse_pss(self, text):
+        for line in text.splitlines():
+            s = line.strip()
+            if re.match(r'TOTAL\s+PSS', s, re.IGNORECASE):
+                nums = re.findall(r'\d+', s)
+                if nums:
+                    return int(nums[0]) // 1024
+        for line in text.splitlines():
+            s = line.strip()
+            if re.match(r'TOTAL\b', s, re.IGNORECASE):
+                nums = re.findall(r'\d+', s)
+                if nums and int(nums[0]) > 0:
+                    return int(nums[0]) // 1024
+        return 0
+
+    def _mem_draw(self):
+        if self._state != "memory":
+            return
+        c = self._mem_canvas
+        c.delete("all")
+        d = self._mem_data
+        W = max(c.winfo_width(), 580)
+        H = max(c.winfo_height(), 260)
+
+        if not d:
+            c.create_text(W // 2, H // 2, text="loading...",
+                          fill=self.FG_DIM, font=("Menlo", 11))
+            return
+        if d.get('error'):
+            c.create_text(W // 2, H // 2, text=f"Error: {d['error']}",
+                          fill="#ff4444", font=("Menlo", 11), width=W - 40)
+            return
+
+        y = 16
+        # Title
+        c.create_text(W // 2, y, text="MEMORY WATCHDOG",
+                      fill=self.FG, font=("Menlo", 13, "bold"), anchor="n")
+        y += 34
+
+        # System stats
+        total = d.get('total_mb', 0)
+        used  = d.get('used_mb',  0)
+        avail = d.get('avail_mb', 0)
+        pct   = d.get('used_pct', 0.0)
+        c.create_text(16, y, text="System RAM", fill=self.FG_DIM,
+                      font=("Menlo", 10), anchor="nw")
+        y += 18
+        stats = f"Total: {total:,} MB    Used: {used:,} MB    Available: {avail:,} MB    ({pct:.0f}%)"
+        c.create_text(16, y, text=stats, fill=self.FG,
+                      font=("Menlo", 11), anchor="nw")
+        y += 22
+
+        # Usage bar
+        bx0, bx1 = 16, W - 16
+        bw = bx1 - bx0
+        used_w = int(bw * pct / 100)
+        bar_color = "#ff4444" if pct > 80 else "#ff8c35" if pct > 60 else self.ACCENT
+        c.create_rectangle(bx0, y, bx1, y + 16, fill="#2a2a2a", outline="#444444")
+        if used_w > 0:
+            c.create_rectangle(bx0, y, bx0 + used_w, y + 16, fill=bar_color, outline="")
+        y += 26
+
+        # App section
+        pkg = d.get('app_pkg', '')
+        pss = d.get('app_pss_mb', 0)
+        c.create_text(16, y, text="Foreground App", fill=self.FG_DIM,
+                      font=("Menlo", 10), anchor="nw")
+        y += 18
+        if pkg:
+            c.create_text(16, y, text=pkg, fill=self.ACCENT,
+                          font=("Menlo", 11), anchor="nw")
+            y += 18
+            pss_str = f"PSS: {pss:,} MB" if pss else "PSS: measuring..."
+            c.create_text(16, y, text=pss_str, fill=self.FG,
+                          font=("Menlo", 11), anchor="nw")
+            y += 22
+        else:
+            c.create_text(16, y, text="(detecting...)", fill=self.FG_DIM,
+                          font=("Menlo", 11), anchor="nw")
+            y += 22
+
+        # Sparkline
+        hist = list(self._mem_history)
+        if len(hist) > 1:
+            y += 4
+            c.create_text(16, y, text="Used % — last 2 min", fill=self.FG_DIM,
+                          font=("Menlo", 10), anchor="nw")
+            y += 16
+            gx0, gy0 = 16, y
+            gx1 = W - 16
+            gh = H - y - 8
+            if gh < 40:
+                gh = 40
+            gy1 = gy0 + gh
+            c.create_rectangle(gx0, gy0, gx1, gy1, fill="#111111", outline="#333333")
+            gw = gx1 - gx0
+            for pct_line in (25, 50, 75):
+                ly = gy0 + int(gh * (1 - pct_line / 100))
+                c.create_line(gx0, ly, gx1, ly, fill="#2a2a2a", dash=(2, 4))
+                c.create_text(gx0 + 3, ly - 1, text=f"{pct_line}%",
+                              fill="#555555", font=("Menlo", 8), anchor="sw")
+            n = len(hist)
+            pts = []
+            for i, v in enumerate(hist):
+                px = gx0 + int(i * gw / max(n - 1, 1))
+                py = gy0 + int(gh * (1 - v / 100))
+                pts.extend([px, py])
+            line_color = "#ff4444" if hist[-1] > 80 else "#ff8c35" if hist[-1] > 60 else self.ACCENT
+            c.create_line(pts, fill=line_color, width=2, smooth=True)
