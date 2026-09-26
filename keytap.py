@@ -28,7 +28,7 @@ import os
 import shutil
 
 try:
-    from PIL import Image, ImageTk
+    from PIL import Image, ImageTk, ImageDraw, ImageFont
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
@@ -42,8 +42,8 @@ HAS_FFMPEG = shutil.which("ffmpeg") is not None
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--serial", default=None, help="ADB serial (e.g. emulator-5554)")
-    p.add_argument("--cols",   type=int, default=4)
-    p.add_argument("--rows",   type=int, default=8)
+    p.add_argument("--cols",   type=int, default=7)
+    p.add_argument("--rows",   type=int, default=14)
     p.add_argument("--height", type=int, default=800, help="mirror window height px")
     return p.parse_args()
 
@@ -81,9 +81,11 @@ class KeyTap:
         self.win_w  = int(dev_w * self.scale)
         self.win_h  = ARGS.height
 
-        self.input_buf = []
-        self.photo     = None
-        self._frame_q  = queue.Queue(maxsize=1)
+        self.input_buf  = []
+        self.photo      = None
+        self._raw_frame = None
+        self._frame_q   = queue.Queue(maxsize=1)
+        self._grid_font = self._load_grid_font()
 
         self._build_ui()
 
@@ -127,36 +129,57 @@ class KeyTap:
 
     # ── Drawing ───────────────────────────────────────────────────────────────
 
-    def redraw(self):
-        self.canvas.itemconfig(self._img_id, image=self.photo or "")
-        self.canvas.delete("overlay")
-        self._draw_grid()
+    def _load_grid_font(self):
+        if not HAS_PIL:
+            return None
+        fs = max(9, int(min(self.win_w / ARGS.cols, self.win_h / ARGS.rows) // 4))
+        for path in [
+            "/System/Library/Fonts/Menlo.ttc",
+            "/System/Library/Fonts/Monaco.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        ]:
+            try:
+                return ImageFont.truetype(path, fs)
+            except Exception:
+                pass
+        return ImageFont.load_default()
 
-    def _draw_grid(self):
-        cw = self.win_w / ARGS.cols
-        ch = self.win_h / ARGS.rows
-        fs = max(9, int(min(cw, ch) // 4))
+    def _composite_grid(self, frame):
+        """Composite 50%-opacity grid onto a PIL Image, return new PIL Image."""
+        base = frame.convert("RGBA")
+        overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+
+        W, H = base.size
+        cw = W / ARGS.cols
+        ch = H / ARGS.rows
         typed = ''.join(self.input_buf).upper()
+        ALPHA = 128  # 50%
 
         for r in range(ARGS.rows):
             for c in range(ARGS.cols):
-                x0, y0 = c * cw, r * ch
-                x1, y1 = x0 + cw, y0 + ch
-                cx, cy = x0 + cw / 2, y0 + ch / 2
+                x0, y0 = int(c * cw), int(r * ch)
+                x1, y1 = int((c + 1) * cw), int((r + 1) * ch)
+                cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
                 label = f"{string.ascii_uppercase[r]}{c + 1}"
+                active = bool(typed and label.startswith(typed))
 
-                active = typed and label.startswith(typed)
-                line_color  = "#FFD700" if active else "#FFFFFF"
-                label_color = "#FFD700" if active else "#AAAAAA"
+                line_rgba  = (255, 215, 0, ALPHA) if active else (255, 255, 255, ALPHA)
+                label_rgba = (255, 215, 0, 230)   if active else (180, 180, 180, ALPHA)
 
-                self.canvas.create_rectangle(
-                    x0, y0, x1, y1,
-                    fill="", outline=line_color, width=1, tags="overlay"
-                )
-                self.canvas.create_text(cx+1, cy+1, text=label,
-                    fill="black", font=("Menlo", fs, "bold"), tags="overlay")
-                self.canvas.create_text(cx, cy, text=label,
-                    fill=label_color, font=("Menlo", fs, "bold"), tags="overlay")
+                draw.rectangle([x0, y0, x1 - 1, y1 - 1], outline=line_rgba)
+                draw.text((cx + 1, cy + 1), label, fill=(0, 0, 0, ALPHA),
+                          font=self._grid_font, anchor="mm")
+                draw.text((cx, cy), label, fill=label_rgba,
+                          font=self._grid_font, anchor="mm")
+
+        return Image.alpha_composite(base, overlay).convert("RGB")
+
+    def redraw(self):
+        if self._raw_frame is not None:
+            composited = self._composite_grid(self._raw_frame)
+            self.photo = ImageTk.PhotoImage(composited)
+        self.canvas.itemconfig(self._img_id, image=self.photo or "")
 
     # ── Capture pipeline ──────────────────────────────────────────────────────
 
@@ -252,15 +275,10 @@ class KeyTap:
         """Main thread: poll queue at ~60fps, update canvas only when new frame ready."""
         try:
             frame = self._frame_q.get_nowait()
-            if isinstance(frame, Image.Image):
-                self.photo = ImageTk.PhotoImage(frame)
-            elif HAS_PIL:
-                self.photo = ImageTk.PhotoImage(frame)
-            else:
-                self.photo = tk.PhotoImage(data=frame)
+            self._raw_frame = frame
+            composited = self._composite_grid(frame)
+            self.photo = ImageTk.PhotoImage(composited)
             self.canvas.itemconfig(self._img_id, image=self.photo)
-            self.canvas.delete("overlay")
-            self._draw_grid()
             self._idle_status()
         except queue.Empty:
             pass
