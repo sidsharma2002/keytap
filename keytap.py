@@ -199,10 +199,10 @@ class KeyTap:
             color = (0, 255, 110, 255)
         elif active is False:
             bg    = (0, 0, 0, 140)
-            color = (0, 200, 75, 180)
+            color = (0, 200, 75, 255)
         else:  # ghost: typing but not this row
             bg    = (0, 0, 0, 70)
-            color = (0, 150, 55, 90)
+            color = (0, 150, 55, 255)
         draw.rectangle([px0, py0, px1, py1], fill=bg)
         draw.text((px0 + pad, py0 + pad), label, fill=color, font=self._grid_font)
 
