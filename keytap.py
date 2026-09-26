@@ -175,18 +175,18 @@ class KeyTap:
                 if not typed:
                     draw.rectangle([x0, y0, x1 - 1, y1 - 1],
                                    outline=(255, 255, 255, 38))
-                    if label:
+                    if label and not CURSOR_MODE:
                         self._draw_pill(draw, x0, y0, label, active=False)
                 elif row_match:
                     draw.rectangle([x0, y0, x1, y1], fill=(255, 215, 0, 28))
                     draw.rectangle([x0, y0, x1 - 1, y1 - 1],
                                    outline=(255, 215, 0, 200))
-                    if label:
+                    if label and not CURSOR_MODE:
                         self._draw_pill(draw, x0, y0, label, active=True)
                 else:
                     draw.rectangle([x0, y0, x1 - 1, y1 - 1],
                                    outline=(255, 255, 255, 15))
-                    if label:
+                    if label and not CURSOR_MODE:
                         self._draw_pill(draw, x0, y0, label, active=None)
 
                 # Cursor cell: green selection border + subtle fill
