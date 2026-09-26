@@ -1,0 +1,15 @@
+{
+  "name": "Dark",
+  "bg":        "#1c1c1e",
+  "bg_input":  "#2c2c2e",
+  "fg":        "#f0f0f0",
+  "fg_dim":    "#888888",
+  "accent":    "#00c864",
+  "sel_bg":    "#3a3a3c",
+  "err":       "#ff4444",
+  "warn":      "#ff8c35",
+  "info":      "#4fc3f7",
+  "graph_bg":  "#111111",
+  "grid_line": "#333333",
+  "bar_bg":    "#2a2a2a"
+}

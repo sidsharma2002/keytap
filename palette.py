@@ -3,6 +3,7 @@ import re
 import threading
 import tkinter as tk
 
+import theme_manager
 from inspectors.memory import MemoryFetcher, adj_label
 
 _DEEPLINK_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9+\-.]*://.+')
@@ -11,12 +12,19 @@ _DEEPLINK_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9+\-.]*://.+')
 class CommandPalette:
     """Spotlight-style package launcher. Trigger: double Shift."""
     W, H   = 440, 380
-    BG     = "#1c1c1e"
-    BG_IN  = "#2c2c2e"
-    FG     = "#f0f0f0"
-    FG_DIM = "#888888"
-    ACCENT = "#00c864"
-    SEL_BG = "#3a3a3c"
+    # Default colors — overridden at __init__ time by active theme
+    BG       = "#1c1c1e"
+    BG_IN    = "#2c2c2e"
+    FG       = "#f0f0f0"
+    FG_DIM   = "#888888"
+    ACCENT   = "#00c864"
+    SEL_BG   = "#3a3a3c"
+    ERR      = "#ff4444"
+    WARN     = "#ff8c35"
+    INFO     = "#4fc3f7"
+    GRAPH_BG = "#111111"
+    GRID_LINE = "#333333"
+    BAR_BG   = "#2a2a2a"
 
     ACTIONS = [
         ("  Launch",        "launch"),
@@ -30,6 +38,20 @@ class CommandPalette:
     ]
 
     def __init__(self, parent, packages, on_action, clipboard_text="", deeplink_history=None, serial=None):
+        t = theme_manager.get_active_theme()
+        self.BG        = t["bg"]
+        self.BG_IN     = t["bg_input"]
+        self.FG        = t["fg"]
+        self.FG_DIM    = t["fg_dim"]
+        self.ACCENT    = t["accent"]
+        self.SEL_BG    = t["sel_bg"]
+        self.ERR       = t["err"]
+        self.WARN      = t["warn"]
+        self.INFO      = t["info"]
+        self.GRAPH_BG  = t["graph_bg"]
+        self.GRID_LINE = t["grid_line"]
+        self.BAR_BG    = t["bar_bg"]
+
         self._packages         = packages
         self._on_action        = on_action
         self._state            = "search"   # "search" | "actions" | "viewer" | "input" | "hierarchy" | "memory"
@@ -78,7 +100,7 @@ class CommandPalette:
         )
         self._entry.pack(fill="x", padx=(0, 8), pady=8, expand=True)
 
-        tk.Frame(self.win, bg="#3a3a3c", height=1).pack(fill="x")
+        tk.Frame(self.win, bg=self.GRID_LINE, height=1).pack(fill="x")
 
         self._content_frame = tk.Frame(self.win, bg=self.BG)
         self._content_frame.pack(fill="both", expand=True, padx=8, pady=4)
@@ -136,6 +158,8 @@ class CommandPalette:
                 self._virtual.append(("  Memory Watchdog — live RAM stats", "memory-watchdog", ""))
             if not ql or ql in "input text":
                 self._virtual.append(("  Input Text — type to send to device", "input-text", ""))
+            if not ql or ql in "theme":
+                self._virtual.append(("  Theme — switch color theme", "theme-switcher", ""))
             if ql and ql in "clipboard":
                 preview = (self._clipboard_text[:60].replace('\n', ' ')
                            if self._clipboard_text else "(empty)")
@@ -225,6 +249,8 @@ class CommandPalette:
                     self._on_action("__view-hierarchy__", "")
                 elif vtype == "memory-watchdog":
                     self._mem_enter()
+                elif vtype == "theme-switcher":
+                    self._show_theme_picker()
                 else:
                     self._on_action(f"__{vtype}__", vvalue)
                     self._close()
@@ -326,6 +352,18 @@ class CommandPalette:
         self._entry.focus_set()
         self._footer.set("Type text  |  Enter=send to device  Esc=back")
 
+    def _show_theme_picker(self):
+        themes = theme_manager.list_themes()
+        current = theme_manager.active_name()
+        items = [(f"* {t.title()}" if t == current else f"  {t.title()}", t) for t in themes]
+
+        def on_select(_, theme_name):
+            theme_manager.set_theme(theme_name)
+            self._on_action("__set-theme__", theme_name)
+            self._close()
+
+        self.show_viewer("Theme", items, on_select=on_select)
+
     def _on_listbox_select(self, _e=None):
         if self._state == "hierarchy" and getattr(self, '_hier_on_hover', None):
             cur = self._listbox.curselection()
@@ -358,7 +396,11 @@ class CommandPalette:
                 self.win.geometry(f"{self.W}x{self.H}")
                 self._back_to_search()
         elif self._state == "viewer":
-            self._back_to_actions()
+            if self._selected_pkg:
+                self._back_to_actions()
+            else:
+                self.win.geometry(f"{self.W}x{self.H}")
+                self._back_to_search()
         elif self._state == "actions":
             self._back_to_search()
         else:
@@ -535,7 +577,7 @@ class CommandPalette:
             return
         if d.get('error'):
             c.create_text(W // 2, 120, text=f"Error: {d['error']}",
-                          fill="#ff4444", font=("Menlo", 11), width=W - 40)
+                          fill=self.ERR, font=("Menlo", 11), width=W - 40)
             return
 
         pkg = d.get('app_pkg', '')
@@ -557,8 +599,8 @@ class CommandPalette:
         java_pct   = d.get('java_heap_pct') or 0.0
         native_mb  = d.get('native_heap_mb', 0)
 
-        gc_color = ("#ff4444" if java_pct > 85 else
-                    "#ff8c35" if java_pct > 65 else self.ACCENT)
+        gc_color = (self.ERR if java_pct > 85 else
+                    self.WARN if java_pct > 65 else self.ACCENT)
 
         c.create_text(pad, y, text="GC PRESSURE", fill=self.FG_DIM,
                       font=("Menlo", 10), anchor="nw")
@@ -566,7 +608,7 @@ class CommandPalette:
         # bar
         bw = mid - pad - 8
         bfill = int(bw * java_pct / 100)
-        c.create_rectangle(pad, y, pad + bw, y + 14, fill="#2a2a2a", outline="#444")
+        c.create_rectangle(pad, y, pad + bw, y + 14, fill=self.BAR_BG, outline=self.GRID_LINE)
         if bfill > 0:
             c.create_rectangle(pad, y, pad + bfill, y + 14, fill=gc_color, outline="")
         c.create_text(pad + bw + 6, y + 1, text=f"{java_pct:.0f}%",
@@ -615,7 +657,7 @@ class CommandPalette:
         # vertical divider
         div_top = 14 + 30 + 14
         div_bot = y + 4
-        c.create_line(mid, div_top, mid, div_bot, fill="#3a3a3c")
+        c.create_line(mid, div_top, mid, div_bot, fill=self.GRID_LINE)
 
         # ── System RAM bar ─────────────────────────────────────────────────────
         y += 12
@@ -623,9 +665,9 @@ class CommandPalette:
         avail = d.get('avail_mb', 0)
         used  = d.get('used_mb', 0)
         pct   = d.get('used_pct', 0.0)
-        sys_color = "#ff4444" if pct > 80 else "#ff8c35" if pct > 60 else self.ACCENT
+        sys_color = self.ERR if pct > 80 else self.WARN if pct > 60 else self.ACCENT
 
-        c.create_line(pad, y, W - pad, y, fill="#3a3a3c")
+        c.create_line(pad, y, W - pad, y, fill=self.GRID_LINE)
         y += 10
         c.create_text(pad, y, text="System RAM", fill=self.FG_DIM,
                       font=("Menlo", 10), anchor="nw")
@@ -635,7 +677,7 @@ class CommandPalette:
         y += 16
         sbw = W - pad * 2
         sfill = int(sbw * pct / 100)
-        c.create_rectangle(pad, y, pad + sbw, y + 10, fill="#2a2a2a", outline="#444")
+        c.create_rectangle(pad, y, pad + sbw, y + 10, fill=self.BAR_BG, outline=self.GRID_LINE)
         if sfill > 0:
             c.create_rectangle(pad, y, pad + sfill, y + 10, fill=sys_color, outline="")
         y += 18
@@ -648,9 +690,9 @@ class CommandPalette:
         for label, hist, line_col in [
             ("System used %", sys_hist, sys_color),
             ("Java heap fill %", heap_hist,
-             "#ff4444" if heap_hist and heap_hist[-1] > 85
-             else "#ff8c35" if heap_hist and heap_hist[-1] > 65
-             else "#4fc3f7"),
+             self.ERR if heap_hist and heap_hist[-1] > 85
+             else self.WARN if heap_hist and heap_hist[-1] > 65
+             else self.INFO),
         ]:
             if len(hist) < 2:
                 continue
@@ -659,11 +701,11 @@ class CommandPalette:
                           font=("Menlo", 9), anchor="nw")
             y += 13
             gx0, gx1, gy0, gy1 = pad, W - pad, y, y + gh
-            c.create_rectangle(gx0, gy0, gx1, gy1, fill="#111111", outline="#333333")
+            c.create_rectangle(gx0, gy0, gx1, gy1, fill=self.GRAPH_BG, outline=self.GRID_LINE)
             gw = gx1 - gx0
             for pline in (25, 50, 75):
                 ly = gy0 + int(gh * (1 - pline / 100))
-                c.create_line(gx0, ly, gx1, ly, fill="#2a2a2a", dash=(2, 4))
+                c.create_line(gx0, ly, gx1, ly, fill=self.BAR_BG, dash=(2, 4))
             n = len(hist)
             pts = []
             for i, v in enumerate(hist):

@@ -438,6 +438,9 @@ class KeyTap:
         )
 
     def _on_palette_action(self, pkg, action):
+        if pkg == "__set-theme__":
+            self.root.after(150, self._open_palette)
+            return
         if pkg == "__view-hierarchy__":
             threading.Thread(target=self._fetch_hierarchy, daemon=True).start()
             return
