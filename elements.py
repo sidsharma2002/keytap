@@ -7,8 +7,8 @@ try:
 except ImportError:
     HAS_U2 = False
 
-# 'e' is reserved for exit-element-mode
-LABELS = [c for c in 'abcdfghijklmnopqrstuvwxyz']  # 25 slots
+# reserved: e=exit, b=back, h=home, r=recents, w/s=scroll
+LABELS = [c for c in 'abcdefghijklmnopqrstuvwxyz' if c not in 'behrsw']  # 20 slots
 
 
 def _parse_bounds(bounds_str):

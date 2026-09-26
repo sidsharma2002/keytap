@@ -189,13 +189,20 @@ class KeyTap:
             self._exit_element_mode() if self._element_mode else self._enter_element_mode()
             return
 
-        # Element mode: letters select elements, arrows still move cursor
+        # Element mode: letters select elements; system shortcuts still work
         if self._element_mode:
             moved = False
-            if sym == 'Up':    self.cursor_row = max(0, self.cursor_row - step); moved = True
+            if sym == 'Up':      self.cursor_row = max(0, self.cursor_row - step); moved = True
             elif sym == 'Down':  self.cursor_row = min(ARGS.rows - 1, self.cursor_row + step); moved = True
             elif sym == 'Left':  self.cursor_col = max(0, self.cursor_col - step); moved = True
             elif sym == 'Right': self.cursor_col = min(ARGS.cols - 1, self.cursor_col + step); moved = True
+            elif sym == 'space':
+                dx, dy = self.cell_to_dev_rc(self.cursor_row, self.cursor_col)
+                self.do_tap(dx, dy)
+            elif char == 'B': self.do_keyevent(4, "back")
+            elif char == 'H': self.do_keyevent(3, "home")
+            elif char == 'R': self.do_keyevent(187, "recents")
+            elif char in ('W', 'S'): self._do_scroll(char)
             elif char and char.isalpha():
                 self._tap_element(char.lower())
             if moved:
