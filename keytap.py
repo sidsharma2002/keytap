@@ -85,10 +85,19 @@ class CommandPalette:
     ACCENT = "#00c864"
     SEL_BG = "#3a3a3c"
 
-    def __init__(self, parent, packages, on_launch):
-        self._packages  = packages
-        self._filtered  = list(packages)
-        self._on_launch = on_launch
+    ACTIONS = [
+        ("  Launch",      "launch"),
+        ("  Force Stop",  "force-stop"),
+        ("  Clear Data",  "clear-data"),
+        ("  Uninstall",   "uninstall"),
+    ]
+
+    def __init__(self, parent, packages, on_action):
+        self._packages     = packages
+        self._filtered     = list(packages)
+        self._on_action    = on_action
+        self._state        = "search"   # "search" | "actions"
+        self._selected_pkg = None
 
         self.win = tk.Toplevel(parent)
         self.win.title("keytap — launch app")
@@ -144,10 +153,10 @@ class CommandPalette:
         for w in (self._entry, self._listbox):
             w.bind("<Up>",     self._up)
             w.bind("<Down>",   self._down)
-            w.bind("<Return>", self._launch)
-            w.bind("<Escape>", self._close)
-        self._listbox.bind("<Double-Button-1>", self._launch)
-        self.win.bind("<Escape>", self._close)
+            w.bind("<Return>", self._select)
+            w.bind("<Escape>", self._on_esc)
+        self._listbox.bind("<Double-Button-1>", self._select)
+        self.win.bind("<Escape>", self._on_esc)
 
     def _filter(self, query):
         q = query.strip().lower()
@@ -157,7 +166,7 @@ class CommandPalette:
             self._listbox.insert(tk.END, f"  {pkg}")
         if self._filtered:
             self._listbox.selection_set(0)
-            self._footer.set(f"{len(self._filtered)} packages  |  Enter=launch  Esc=close")
+            self._footer.set(f"{len(self._filtered)} packages  |  Enter=select  Esc=close")
         else:
             self._footer.set("no match")
 
@@ -180,13 +189,55 @@ class CommandPalette:
 
     def _selected(self):
         cur = self._listbox.curselection()
-        return self._filtered[cur[0]] if cur else None
+        if not cur:
+            return None
+        if self._state == "search":
+            return self._filtered[cur[0]]
+        return self.ACTIONS[cur[0]][1]
 
-    def _launch(self, _e=None):
-        pkg = self._selected()
-        if pkg:
-            self._on_launch(pkg)
+    def _select(self, _e=None):
+        if self._state == "search":
+            pkg = self._filtered[self._listbox.curselection()[0]] if self._listbox.curselection() else None
+            if pkg:
+                self._selected_pkg = pkg
+                self._show_actions(pkg)
+        else:
+            self._execute_action()
+        return "break"
+
+    def _show_actions(self, pkg):
+        self._state = "actions"
+        self._entry.config(state="disabled")
+        self._var.set("")
+        self._listbox.delete(0, tk.END)
+        for label, _ in self.ACTIONS:
+            self._listbox.insert(tk.END, label)
+        self._listbox.selection_set(0)
+        self._listbox.focus_set()
+        short = pkg if len(pkg) <= 40 else "..." + pkg[-37:]
+        self._footer.set(f"{short}  |  Enter=execute  Esc=back")
+
+    def _back_to_search(self):
+        self._state = "search"
+        self._selected_pkg = None
+        self._entry.config(state="normal")
+        self._filter(self._var.get())
+        self._entry.focus_set()
+
+    def _execute_action(self):
+        cur = self._listbox.curselection()
+        if not cur:
+            return
+        _, action = self.ACTIONS[cur[0]]
+        self._on_action(self._selected_pkg, action)
+        self._close()
+
+    def _on_esc(self, _e=None):
+        if self._state == "actions":
+            self._back_to_search()
+        else:
             self._close()
+        return "break"
 
     def _close(self, _e=None):
         self.win.destroy()
@@ -634,16 +685,35 @@ class KeyTap:
             return
         self._palette = CommandPalette(
             self.root, self._packages,
-            on_launch=self._launch_package
+            on_action=self._on_palette_action
         )
 
-    def _launch_package(self, pkg):
-        self.status(f"launching {pkg}")
-        threading.Thread(
-            target=lambda: adb("shell", "monkey", "-p", pkg,
-                               "-c", "android.intent.category.LAUNCHER", "1"),
-            daemon=True
-        ).start()
+    def _on_palette_action(self, pkg, action):
+        if action == "launch":
+            self.status(f"launch {pkg}")
+            threading.Thread(
+                target=lambda: adb("shell", "monkey", "-p", pkg,
+                                   "-c", "android.intent.category.LAUNCHER", "1"),
+                daemon=True
+            ).start()
+        elif action == "force-stop":
+            self.status(f"force-stop {pkg}")
+            threading.Thread(
+                target=lambda: adb("shell", "am", "force-stop", pkg),
+                daemon=True
+            ).start()
+        elif action == "clear-data":
+            self.status(f"clear-data {pkg}")
+            threading.Thread(
+                target=lambda: adb("shell", "pm", "clear", pkg),
+                daemon=True
+            ).start()
+        elif action == "uninstall":
+            self.status(f"uninstall {pkg}")
+            threading.Thread(
+                target=lambda: adb("shell", "pm", "uninstall", pkg),
+                daemon=True
+            ).start()
 
     # ── Run ──────────────────────────────────────────────────────────────────
 
