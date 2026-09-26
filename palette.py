@@ -39,11 +39,12 @@ class CommandPalette:
         self._pkg_filtered     = list(packages)
         self._serial           = serial
         # memory watchdog state
-        self._mem_polling  = False
-        self._mem_stop     = threading.Event()
-        self._mem_data     = {}
-        self._mem_history  = collections.deque(maxlen=60)
-        self._mem_canvas   = None
+        self._mem_polling       = False
+        self._mem_stop          = threading.Event()
+        self._mem_data          = {}
+        self._mem_history       = collections.deque(maxlen=60)  # system used %
+        self._java_heap_history = collections.deque(maxlen=60)  # java heap fill %
+        self._mem_canvas        = None
 
         self.win = tk.Toplevel(parent)
         self.win.title("keytap — launch app")
@@ -463,11 +464,12 @@ class CommandPalette:
         self._state = "memory"
         self._entry.config(state="disabled")
         self.win.resizable(True, True)
-        self.win.geometry(f"620x{self.H}")
+        self.win.geometry(f"620x480")
         self._listbox.pack_forget()
         self._mem_canvas.pack(fill="both", expand=True)
         self._footer.set("Cmd+R=refresh  Esc=exit")
         self._mem_history.clear()
+        self._java_heap_history.clear()
         self._mem_data = {}
         self._mem_canvas.delete("all")
         self._mem_canvas.create_text(310, 130, text="fetching memory stats...",
@@ -491,6 +493,7 @@ class CommandPalette:
     def _mem_restart(self):
         self._mem_stop_poll()
         self._mem_history.clear()
+        self._java_heap_history.clear()
         self._mem_data = {}
         self._mem_canvas.delete("all")
         self._mem_canvas.create_text(310, 130, text="refreshing...",
@@ -512,6 +515,8 @@ class CommandPalette:
             self._mem_data = data
             if data.get('used_pct') is not None:
                 self._mem_history.append(data['used_pct'])
+            if data.get('java_heap_pct') is not None:
+                self._java_heap_history.append(data['java_heap_pct'])
             try:
                 self.win.after(0, self._mem_draw)
             except Exception:
@@ -533,6 +538,7 @@ class CommandPalette:
             avail_kb = meminfo.get('MemAvailable', meminfo.get('MemFree', 0))
             used_kb  = max(0, total_kb - avail_kb)
             used_pct = (used_kb / total_kb * 100) if total_kb else 0.0
+            avail_pct = (avail_kb / total_kb * 100) if total_kb else 100.0
 
             data = {
                 'total_mb': total_kb // 1024,
@@ -540,7 +546,16 @@ class CommandPalette:
                 'used_mb':  used_kb  // 1024,
                 'used_pct': used_pct,
                 'app_pkg':  '',
-                'app_pss_mb': 0,
+                # GC metrics
+                'java_heap_used_mb': 0,
+                'java_heap_total_mb': 0,
+                'java_heap_pct': None,
+                'native_heap_mb': 0,
+                # Death risk metrics
+                'rss_mb': 0,
+                'oom_adj': None,
+                'death_risk': 'Unknown',
+                'death_risk_color': self.FG_DIM,
                 'error': None,
             }
 
@@ -550,14 +565,30 @@ class CommandPalette:
             if m:
                 pkg = m.group(1)
                 data['app_pkg'] = pkg
-                pss_out = self._adb_shell_cmd(f'dumpsys meminfo {pkg}', u2_dev)
-                data['app_pss_mb'] = self._parse_pss(pss_out)
+                meminfo_out = self._adb_shell_cmd(f'dumpsys meminfo {pkg}', u2_dev)
+                app = self._parse_app_meminfo(meminfo_out)
+                data.update(app)
+                # oom_score_adj
+                if app.get('pid'):
+                    adj_out = self._adb_shell_cmd(
+                        f'cat /proc/{app["pid"]}/oom_score_adj', u2_dev)
+                    s = adj_out.strip()
+                    if s.lstrip('-').isdigit():
+                        adj = int(s)
+                        data['oom_adj'] = adj
+                        label, color = self._compute_death_risk(adj, avail_pct)
+                        data['death_risk'] = label
+                        data['death_risk_color'] = color
 
             return data
         except Exception as e:
             return {
                 'error': str(e), 'total_mb': 0, 'avail_mb': 0,
-                'used_mb': 0, 'used_pct': 0.0, 'app_pkg': '', 'app_pss_mb': 0,
+                'used_mb': 0, 'used_pct': 0.0, 'avail_pct': 100.0,
+                'app_pkg': '', 'java_heap_used_mb': 0, 'java_heap_total_mb': 0,
+                'java_heap_pct': None, 'native_heap_mb': 0, 'rss_mb': 0,
+                'oom_adj': None, 'death_risk': 'Unknown',
+                'death_risk_color': self.FG_DIM,
             }
 
     def _adb_shell_cmd(self, cmd, u2_dev=None):
@@ -577,20 +608,70 @@ class CommandPalette:
         except Exception:
             return ''
 
-    def _parse_pss(self, text):
+    def _parse_app_meminfo(self, text):
+        """Parse dumpsys meminfo output → dict with heap/rss/pid fields."""
+        result = {
+            'pid': None,
+            'java_heap_used_mb': 0, 'java_heap_total_mb': 0, 'java_heap_pct': None,
+            'native_heap_mb': 0, 'rss_mb': 0,
+        }
         for line in text.splitlines():
+            # PID from header: "** MEMINFO in pid 12345 [pkg] **"
+            m = re.search(r'MEMINFO in pid (\d+)', line)
+            if m:
+                result['pid'] = int(m.group(1))
+                continue
+            nums = re.findall(r'\d+', line)
+            if not nums:
+                continue
             s = line.strip()
-            if re.match(r'TOTAL\s+PSS', s, re.IGNORECASE):
-                nums = re.findall(r'\d+', s)
-                if nums:
-                    return int(nums[0]) // 1024
-        for line in text.splitlines():
-            s = line.strip()
-            if re.match(r'TOTAL\b', s, re.IGNORECASE):
-                nums = re.findall(r'\d+', s)
-                if nums and int(nums[0]) > 0:
-                    return int(nums[0]) // 1024
-        return 0
+            # Dalvik/Art heap = Java heap (columns: PSS, PD, PC, Swap, RSS, HeapSize, HeapAlloc, HeapFree)
+            if s.startswith('Dalvik Heap') or s.startswith('Art Heap'):
+                if len(nums) >= 7:
+                    heap_size  = int(nums[5])
+                    heap_alloc = int(nums[6])
+                    if heap_size > 0:
+                        result['java_heap_total_mb'] = heap_size  // 1024
+                        result['java_heap_used_mb']  = heap_alloc // 1024
+                        result['java_heap_pct'] = heap_alloc / heap_size * 100
+            # Native heap PSS (first number on line)
+            elif s.startswith('Native Heap'):
+                result['native_heap_mb'] = int(nums[0]) // 1024
+            # TOTAL line: PSS is nums[0], RSS is nums[4] (when 5+ cols present)
+            elif re.match(r'TOTAL\b', s, re.IGNORECASE) or re.match(r'TOTAL\s+PSS', s, re.IGNORECASE):
+                if len(nums) >= 5:
+                    result['rss_mb'] = int(nums[4]) // 1024
+                elif not result['rss_mb'] and nums:
+                    result['rss_mb'] = int(nums[0]) // 1024
+        return result
+
+    def _compute_death_risk(self, adj, avail_pct):
+        """Map oom_score_adj + system free % → (label, color)."""
+        if adj <= 0:
+            label, color = "Safe", self.ACCENT
+        elif adj <= 200:
+            label, color = "Low", "#90ee90"
+        elif adj <= 500:
+            label, color = "Moderate", "#ffa040"
+        elif adj <= 700:
+            label, color = "High", "#ff6b35"
+        else:
+            label, color = "Critical", "#ff4444"
+        # Elevate one level if system is critically low on memory
+        if avail_pct < 10 and adj > 0:
+            escalate = {"Low": ("Moderate", "#ffa040"), "Moderate": ("High", "#ff6b35"),
+                        "High": ("Critical", "#ff4444"), "Safe": ("Low", "#90ee90")}
+            if label in escalate:
+                label, color = escalate[label]
+        return label, color
+
+    def _adj_label(self, adj):
+        if adj is None:   return ""
+        if adj <= 0:      return "foreground"
+        if adj <= 200:    return "visible"
+        if adj <= 500:    return "service"
+        if adj <= 700:    return "background"
+        return "cached"
 
     def _mem_draw(self):
         if self._state != "memory":
@@ -599,90 +680,147 @@ class CommandPalette:
         c.delete("all")
         d = self._mem_data
         W = max(c.winfo_width(), 580)
-        H = max(c.winfo_height(), 260)
 
         if not d:
-            c.create_text(W // 2, H // 2, text="loading...",
+            c.create_text(W // 2, 120, text="loading...",
                           fill=self.FG_DIM, font=("Menlo", 11))
             return
         if d.get('error'):
-            c.create_text(W // 2, H // 2, text=f"Error: {d['error']}",
+            c.create_text(W // 2, 120, text=f"Error: {d['error']}",
                           fill="#ff4444", font=("Menlo", 11), width=W - 40)
             return
 
-        y = 16
-        # Title
-        c.create_text(W // 2, y, text="MEMORY WATCHDOG",
-                      fill=self.FG, font=("Menlo", 13, "bold"), anchor="n")
-        y += 34
-
-        # System stats
-        total = d.get('total_mb', 0)
-        used  = d.get('used_mb',  0)
-        avail = d.get('avail_mb', 0)
-        pct   = d.get('used_pct', 0.0)
-        c.create_text(16, y, text="System RAM", fill=self.FG_DIM,
-                      font=("Menlo", 10), anchor="nw")
-        y += 18
-        stats = f"Total: {total:,} MB    Used: {used:,} MB    Available: {avail:,} MB    ({pct:.0f}%)"
-        c.create_text(16, y, text=stats, fill=self.FG,
-                      font=("Menlo", 11), anchor="nw")
-        y += 22
-
-        # Usage bar
-        bx0, bx1 = 16, W - 16
-        bw = bx1 - bx0
-        used_w = int(bw * pct / 100)
-        bar_color = "#ff4444" if pct > 80 else "#ff8c35" if pct > 60 else self.ACCENT
-        c.create_rectangle(bx0, y, bx1, y + 16, fill="#2a2a2a", outline="#444444")
-        if used_w > 0:
-            c.create_rectangle(bx0, y, bx0 + used_w, y + 16, fill=bar_color, outline="")
-        y += 26
-
-        # App section
         pkg = d.get('app_pkg', '')
-        pss = d.get('app_pss_mb', 0)
-        c.create_text(16, y, text="Foreground App", fill=self.FG_DIM,
+
+        y = 14
+        # ── Title ─────────────────────────────────────────────────────────────
+        title = f"MEMORY WATCHDOG  —  {pkg}" if pkg else "MEMORY WATCHDOG"
+        c.create_text(W // 2, y, text=title,
+                      fill=self.FG, font=("Menlo", 12, "bold"), anchor="n")
+        y += 30
+
+        # ── Two panels: GC Pressure (left)  |  Death Risk (right) ────────────
+        mid = W // 2 - 8
+        pad = 16
+
+        # --- GC Pressure panel ------------------------------------------------
+        java_used  = d.get('java_heap_used_mb', 0)
+        java_total = d.get('java_heap_total_mb', 0)
+        java_pct   = d.get('java_heap_pct') or 0.0
+        native_mb  = d.get('native_heap_mb', 0)
+
+        gc_color = ("#ff4444" if java_pct > 85 else
+                    "#ff8c35" if java_pct > 65 else self.ACCENT)
+
+        c.create_text(pad, y, text="GC PRESSURE", fill=self.FG_DIM,
                       font=("Menlo", 10), anchor="nw")
         y += 18
-        if pkg:
-            c.create_text(16, y, text=pkg, fill=self.ACCENT,
-                          font=("Menlo", 11), anchor="nw")
-            y += 18
-            pss_str = f"PSS: {pss:,} MB" if pss else "PSS: measuring..."
-            c.create_text(16, y, text=pss_str, fill=self.FG,
-                          font=("Menlo", 11), anchor="nw")
-            y += 22
-        else:
-            c.create_text(16, y, text="(detecting...)", fill=self.FG_DIM,
-                          font=("Menlo", 11), anchor="nw")
-            y += 22
+        # bar
+        bw = mid - pad - 8
+        bfill = int(bw * java_pct / 100)
+        c.create_rectangle(pad, y, pad + bw, y + 14, fill="#2a2a2a", outline="#444")
+        if bfill > 0:
+            c.create_rectangle(pad, y, pad + bfill, y + 14, fill=gc_color, outline="")
+        c.create_text(pad + bw + 6, y + 1, text=f"{java_pct:.0f}%",
+                      fill=gc_color, font=("Menlo", 10), anchor="nw")
+        y += 20
+        if java_total:
+            c.create_text(pad, y, text=f"Java Heap: {java_used}/{java_total} MB",
+                          fill=self.FG, font=("Menlo", 11), anchor="nw")
+            y += 17
+        if native_mb:
+            c.create_text(pad, y, text=f"Native Heap: {native_mb} MB",
+                          fill=self.FG_DIM, font=("Menlo", 11), anchor="nw")
+            y += 17
 
-        # Sparkline
-        hist = list(self._mem_history)
-        if len(hist) > 1:
+        # --- Death Risk panel (right, same top) --------------------------------
+        adj       = d.get('oom_adj')
+        risk      = d.get('death_risk', 'Unknown')
+        risk_color = d.get('death_risk_color', self.FG_DIM)
+        rss_mb    = d.get('rss_mb', 0)
+
+        ry = y - (17 * (1 + bool(native_mb) + bool(java_total))) - 20 - 18
+        # reset right-panel y to match left panel top
+        ry_start = 14 + 30 + 18  # after title + gap + label
+        rx = mid + 16
+
+        c.create_text(rx, ry_start, text="DEATH RISK", fill=self.FG_DIM,
+                      font=("Menlo", 10), anchor="nw")
+        # badge
+        badge_y = ry_start + 14
+        badge_w, badge_h = 120, 26
+        c.create_rectangle(rx, badge_y, rx + badge_w, badge_y + badge_h,
+                            fill=risk_color, outline="")
+        c.create_text(rx + badge_w // 2, badge_y + badge_h // 2,
+                      text=risk.upper(), fill="#000000" if risk == "Safe" else "#ffffff",
+                      font=("Menlo", 11, "bold"), anchor="center")
+        detail_y = badge_y + badge_h + 6
+        if adj is not None:
+            c.create_text(rx, detail_y,
+                          text=f"adj {adj}  ({self._adj_label(adj)})",
+                          fill=self.FG, font=("Menlo", 11), anchor="nw")
+            detail_y += 17
+        if rss_mb:
+            c.create_text(rx, detail_y, text=f"RSS: {rss_mb} MB",
+                          fill=self.FG_DIM, font=("Menlo", 11), anchor="nw")
+
+        # vertical divider
+        div_top = 14 + 30 + 14
+        div_bot = y + 4
+        c.create_line(mid, div_top, mid, div_bot, fill="#3a3a3c")
+
+        # ── System RAM bar ─────────────────────────────────────────────────────
+        y += 12
+        total = d.get('total_mb', 0)
+        avail = d.get('avail_mb', 0)
+        used  = d.get('used_mb', 0)
+        pct   = d.get('used_pct', 0.0)
+        sys_color = "#ff4444" if pct > 80 else "#ff8c35" if pct > 60 else self.ACCENT
+
+        c.create_line(pad, y, W - pad, y, fill="#3a3a3c")
+        y += 10
+        c.create_text(pad, y, text="System RAM", fill=self.FG_DIM,
+                      font=("Menlo", 10), anchor="nw")
+        c.create_text(W - pad, y,
+                      text=f"{used:,} / {total:,} MB  ({pct:.0f}%)",
+                      fill=self.FG, font=("Menlo", 10), anchor="ne")
+        y += 16
+        sbw = W - pad * 2
+        sfill = int(sbw * pct / 100)
+        c.create_rectangle(pad, y, pad + sbw, y + 10, fill="#2a2a2a", outline="#444")
+        if sfill > 0:
+            c.create_rectangle(pad, y, pad + sfill, y + 10, fill=sys_color, outline="")
+        y += 18
+
+        # ── Dual sparklines ───────────────────────────────────────────────────
+        sys_hist  = list(self._mem_history)
+        heap_hist = list(self._java_heap_history)
+        gh = 44  # graph height each
+
+        for label, hist, line_col in [
+            ("System used %", sys_hist, sys_color),
+            ("Java heap fill %", heap_hist,
+             "#ff4444" if heap_hist and heap_hist[-1] > 85
+             else "#ff8c35" if heap_hist and heap_hist[-1] > 65
+             else "#4fc3f7"),
+        ]:
+            if len(hist) < 2:
+                continue
             y += 4
-            c.create_text(16, y, text="Used % — last 2 min", fill=self.FG_DIM,
-                          font=("Menlo", 10), anchor="nw")
-            y += 16
-            gx0, gy0 = 16, y
-            gx1 = W - 16
-            gh = H - y - 8
-            if gh < 40:
-                gh = 40
-            gy1 = gy0 + gh
+            c.create_text(pad, y, text=label, fill=self.FG_DIM,
+                          font=("Menlo", 9), anchor="nw")
+            y += 13
+            gx0, gx1, gy0, gy1 = pad, W - pad, y, y + gh
             c.create_rectangle(gx0, gy0, gx1, gy1, fill="#111111", outline="#333333")
             gw = gx1 - gx0
-            for pct_line in (25, 50, 75):
-                ly = gy0 + int(gh * (1 - pct_line / 100))
+            for pline in (25, 50, 75):
+                ly = gy0 + int(gh * (1 - pline / 100))
                 c.create_line(gx0, ly, gx1, ly, fill="#2a2a2a", dash=(2, 4))
-                c.create_text(gx0 + 3, ly - 1, text=f"{pct_line}%",
-                              fill="#555555", font=("Menlo", 8), anchor="sw")
             n = len(hist)
             pts = []
             for i, v in enumerate(hist):
                 px = gx0 + int(i * gw / max(n - 1, 1))
                 py = gy0 + int(gh * (1 - v / 100))
                 pts.extend([px, py])
-            line_color = "#ff4444" if hist[-1] > 80 else "#ff8c35" if hist[-1] > 60 else self.ACCENT
-            c.create_line(pts, fill=line_color, width=2, smooth=True)
+            c.create_line(pts, fill=line_col, width=2, smooth=True)
+            y += gh + 2
