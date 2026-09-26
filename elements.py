@@ -8,7 +8,9 @@ except ImportError:
     HAS_U2 = False
 
 # reserved: e=exit, b=back, h=home, r=recents, w/s=scroll
-LABELS = [c for c in 'abcdefghijklmnopqrstuvwxyz' if c not in 'behrsw']  # 20 slots
+_CHARS = [c for c in 'abcdefghijklmnopqrstuvwxyz' if c not in 'behrsw']  # 20 chars
+LABEL_CHARS = frozenset(_CHARS)
+LABELS = [a + b for a in _CHARS for b in _CHARS]  # 400 two-char labels
 
 
 def _parse_bounds(bounds_str):

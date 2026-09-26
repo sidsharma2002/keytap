@@ -1,7 +1,7 @@
 import sys
 import string
 import tkinter as tk
-from PIL import ImageTk
+from PIL import ImageTk, ImageChops
 import threading
 import time
 
@@ -10,6 +10,7 @@ from adb import adb, get_device_size
 from capture import CaptureManager
 from grid import GridRenderer
 from palette import CommandPalette
+from elements import LABEL_CHARS
 
 
 class KeyTap:
@@ -33,6 +34,10 @@ class KeyTap:
         self._elements        = []
         self._element_mode    = False
         self._element_loading = False
+        self._element_buf     = []
+        self._elem_ref_frame   = None
+        self._elem_last_dump_t = 0.0
+        self._elem_show_bounds = False
 
         self._build_ui()
 
@@ -89,12 +94,23 @@ class KeyTap:
         win_elements = None
         if self._element_mode and self._elements:
             s = self.scale
-            win_elements = [
-                {**el,
-                 'wx1': int(el['x1'] * s), 'wy1': int(el['y1'] * s),
-                 'wx2': int(el['x2'] * s), 'wy2': int(el['y2'] * s)}
-                for el in self._elements
-            ]
+            buf = self._element_buf
+            win_elements = []
+            for el in self._elements:
+                if not buf:
+                    display_label, active = el['label'], True
+                elif el['label'][0] == buf[0]:
+                    display_label, active = el['label'], True
+                else:
+                    display_label, active = el['label'], False
+                win_elements.append({
+                    **el,
+                    'wx1': int(el['x1'] * s), 'wy1': int(el['y1'] * s),
+                    'wx2': int(el['x2'] * s), 'wy2': int(el['y2'] * s),
+                    'display_label': display_label,
+                    'active': active,
+                    'show_bounds': self._elem_show_bounds,
+                })
         composited = self._renderer.composite(
             frame, self.cursor_row, self.cursor_col, self.input_buf, win_elements
         )
@@ -111,6 +127,8 @@ class KeyTap:
             self._raw_frame = frame
             self._push_frame(frame)
             self._idle_status()
+            if self._element_mode and not self._element_loading:
+                self._check_screen_change(frame)
         except Exception:
             pass
         self.root.after(16, self._display_loop)
@@ -123,8 +141,9 @@ class KeyTap:
     def _idle_status(self):
         if self._element_mode:
             n = len(self._elements)
+            bounds_hint = "Tab=show bounds" if not self._elem_show_bounds else "Tab=hide bounds"
             self.status(
-                f"element mode: {n} elements  |  a-z=tap element  arrows=move  e=exit"
+                f"element mode: {n} elements  |  type 2-char label to tap  {bounds_hint}  e=exit"
             )
             return
         if CURSOR_MODE:
@@ -189,13 +208,21 @@ class KeyTap:
             self._exit_element_mode() if self._element_mode else self._enter_element_mode()
             return
 
-        # Element mode: letters select elements; system shortcuts still work
+        # Element mode: 2-char label selection; system shortcuts still work
         if self._element_mode:
             moved = False
-            if sym == 'Up':      self.cursor_row = max(0, self.cursor_row - step); moved = True
-            elif sym == 'Down':  self.cursor_row = min(ARGS.rows - 1, self.cursor_row + step); moved = True
-            elif sym == 'Left':  self.cursor_col = max(0, self.cursor_col - step); moved = True
-            elif sym == 'Right': self.cursor_col = min(ARGS.cols - 1, self.cursor_col + step); moved = True
+            if sym == 'Tab':
+                self._elem_show_bounds = not self._elem_show_bounds
+                self.redraw()
+            elif sym == 'BackSpace':
+                if self._element_buf:
+                    self._element_buf.clear()
+                    self.redraw()
+                    self._idle_status()
+            elif sym == 'Up':      self.cursor_row = max(0, self.cursor_row - step); moved = True
+            elif sym == 'Down':    self.cursor_row = min(ARGS.rows - 1, self.cursor_row + step); moved = True
+            elif sym == 'Left':    self.cursor_col = max(0, self.cursor_col - step); moved = True
+            elif sym == 'Right':   self.cursor_col = min(ARGS.cols - 1, self.cursor_col + step); moved = True
             elif sym == 'space':
                 dx, dy = self.cell_to_dev_rc(self.cursor_row, self.cursor_col)
                 self.do_tap(dx, dy)
@@ -203,8 +230,8 @@ class KeyTap:
             elif char == 'H': self.do_keyevent(3, "home")
             elif char == 'R': self.do_keyevent(187, "recents")
             elif char in ('W', 'S'): self._do_scroll(char)
-            elif char and char.isalpha():
-                self._tap_element(char.lower())
+            elif char and char.lower() in LABEL_CHARS:
+                self._handle_element_input(char.lower())
             if moved:
                 self.redraw()
                 self._idle_status()
@@ -285,7 +312,8 @@ class KeyTap:
         if self._element_loading:
             return
         self._element_loading = True
-        self.status("dumping UI hierarchy...")
+        if not self._element_mode:
+            self.status("dumping UI hierarchy...")
         threading.Thread(target=self._fetch_elements, daemon=True).start()
 
     def _fetch_elements(self):
@@ -300,8 +328,23 @@ class KeyTap:
         self._element_loading = False
         self._elements = elements
         self._element_mode = True
+        self._elem_ref_frame = self._raw_frame
+        self._elem_last_dump_t = time.time()
+        self._element_buf.clear()
         self.redraw()
         self._idle_status()
+
+    def _check_screen_change(self, frame):
+        if self._elem_ref_frame is None:
+            return
+        if time.time() - self._elem_last_dump_t < 1.5:
+            return
+        small = frame.resize((90, 200))
+        ref   = self._elem_ref_frame.resize((90, 200))
+        diff  = ImageChops.difference(small, ref)
+        bbox  = diff.getbbox()
+        if bbox and (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]) > 90 * 200 * 0.08:
+            self._enter_element_mode()
 
     def _on_element_error(self, msg):
         self._element_loading = False
@@ -309,18 +352,33 @@ class KeyTap:
 
     def _exit_element_mode(self):
         self._elements = []
+        self._element_buf.clear()
         self._element_mode = False
+        self._elem_show_bounds = False
         self.redraw()
         self._idle_status()
 
-    def _tap_element(self, char):
-        for el in self._elements:
-            if el['label'] == char:
-                self.do_tap(el['cx'], el['cy'])
-                hint = el['text'] or el['resource_id'] or el['label']
-                self.status(f"tap '{hint}' ({el['cx']},{el['cy']})")
+    def _handle_element_input(self, char):
+        self._element_buf.append(char)
+        if len(self._element_buf) == 1:
+            matches = [el for el in self._elements if el['label'][0] == char]
+            if not matches:
+                self.status(f"no element '{char}...'")
+                self._element_buf.clear()
                 return
-        self.status(f"no element '{char}'")
+            self.redraw()
+            self.status(f"'{char}...' - press second key  |  Backspace=cancel")
+        elif len(self._element_buf) == 2:
+            label = ''.join(self._element_buf)
+            self._element_buf.clear()
+            el = next((e for e in self._elements if e['label'] == label), None)
+            if el:
+                hint = el['text'] or el['resource_id'] or label
+                self.do_tap(el['cx'], el['cy'])
+                self.status(f"tap '{hint}' ({el['cx']},{el['cy']})")
+            else:
+                self.status(f"no element '{label}'")
+            self.redraw()
 
     # ── Command palette ──────────────────────────────────────────────────────
 

@@ -10,6 +10,19 @@ class GridRenderer:
 
     def __init__(self, win_w, win_h):
         self.font = self._load_font(win_w, win_h)
+        self.elem_font = self._load_font_fixed(10)
+
+    def _load_font_fixed(self, size):
+        for path in [
+            "/System/Library/Fonts/Menlo.ttc",
+            "/System/Library/Fonts/Monaco.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        ]:
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                pass
+        return ImageFont.load_default()
 
     def _load_font(self, win_w, win_h):
         fs = max(8, int(min(win_w / ARGS.cols, win_h / ARGS.rows) // 5))
@@ -70,24 +83,38 @@ class GridRenderer:
         return Image.alpha_composite(base, overlay).convert("RGB")
 
     def _draw_elements(self, draw, elements):
+        show_bounds = elements[0].get('show_bounds', True) if elements else True
         for el in elements:
             x1, y1, x2, y2 = el['wx1'], el['wy1'], el['wx2'], el['wy2']
-            color = (0, 210, 255, 220) if el['clickable'] else (160, 160, 255, 180)
-            draw.rectangle([x1, y1, x2, y2], fill=(0, 210, 255, 18))
-            draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
-            self._draw_element_label(draw, x1, y1, el['label'], color)
+            if el['active']:
+                if show_bounds:
+                    outline = (0, 210, 255, 220) if el['clickable'] else (160, 160, 255, 180)
+                    draw.rectangle([x1, y1, x2, y2], fill=(0, 210, 255, 22))
+                    draw.rectangle([x1, y1, x2, y2], outline=outline, width=2)
+                self._draw_element_label(draw, x1, y1, el['display_label'], active=True)
+            else:
+                if show_bounds:
+                    draw.rectangle([x1, y1, x2, y2], outline=(80, 80, 80, 100), width=1)
+                self._draw_element_label(draw, x1, y1, el['display_label'], active=False)
 
-    def _draw_element_label(self, draw, x0, y0, label, color):
-        pad = 3
+    def _draw_element_label(self, draw, x0, y0, label, active=True):
+        pad = 4
         try:
-            bbox = self.font.getbbox(label)
-            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            bbox = self.elem_font.getbbox(label)
+            bl, bt, br, bb = bbox
+            tw, th = br - bl, bb - bt
         except AttributeError:
-            tw, th = len(label) * 7, 10
+            bl, bt, tw, th = 0, 0, len(label) * 9, 14
         px0, py0 = x0 + 2, y0 + 2
         px1, py1 = px0 + tw + pad * 2, py0 + th + pad * 2
-        draw.rectangle([px0, py0, px1, py1], fill=(0, 0, 0, 210))
-        draw.text((px0 + pad, py0 + pad), label, fill=color, font=self.font)
+        # offset text by -bl, -bt so glyph sits flush inside the pill
+        tx, ty = px0 + pad - bl, py0 + pad - bt
+        if active:
+            draw.rectangle([px0, py0, px1, py1], fill=(0, 0, 0, 255))
+            draw.text((tx, ty), label, fill=(255, 230, 0, 255), font=self.elem_font)
+        else:
+            draw.rectangle([px0, py0, px1, py1], fill=(0, 0, 0, 160))
+            draw.text((tx, ty), label, fill=(80, 80, 80, 200), font=self.elem_font)
 
     def _draw_pill(self, draw, x0, y0, label, active=False):
         pad = 3
