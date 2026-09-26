@@ -27,6 +27,8 @@ import threading
 import base64
 import re
 import io
+import queue
+import time
 
 try:
     from PIL import Image, ImageTk
@@ -91,8 +93,8 @@ class KeyTap:
         self.hint_mode  = False
         self.hint_buf   = []
         self.swipe_mode = False
-        self.refreshing = False
         self.photo      = None
+        self._frame_q   = queue.Queue(maxsize=1)
 
         self._build_ui()
 
@@ -183,43 +185,50 @@ class KeyTap:
                 self.canvas.create_text(cx, cy, text=label,
                     fill=label_color, font=("Menlo", fs, "bold"), tags="overlay")
 
-    # ── Screencap ─────────────────────────────────────────────────────────────
+    # ── Capture pipeline ──────────────────────────────────────────────────────
 
-    def refresh(self, callback=None):
-        if self.refreshing:
-            return
-        self.refreshing = True
-        self.status("refreshing...")
-
-        def worker():
+    def _capture_loop(self):
+        """Background thread: ADB + PIL resize, feeds _frame_q."""
+        while True:
             try:
                 png = take_screencap()
                 if png and len(png) > 512:
-                    self.root.after(0, lambda: self._apply(png, callback))
+                    if HAS_PIL:
+                        img = Image.open(io.BytesIO(png))
+                        img = img.resize((self.win_w, self.win_h), Image.BILINEAR)
+                        frame = img
+                    else:
+                        frame = base64.b64encode(png).decode()
+                    # Drop stale frame, keep only latest
+                    try:
+                        self._frame_q.get_nowait()
+                    except queue.Empty:
+                        pass
+                    self._frame_q.put(frame)
                 else:
                     self.root.after(0, lambda: self.status("screencap empty"))
+                    time.sleep(0.5)
             except Exception as e:
-                self.root.after(0, lambda: self.status(f"screencap error: {e}"))
-            finally:
-                self.refreshing = False
+                self.root.after(0, lambda e=e: self.status(f"capture error: {e}"))
+                time.sleep(0.5)
 
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _apply(self, png, callback=None):
+    def _display_loop(self):
+        """Main thread: poll queue at ~60fps, update canvas only when new frame ready."""
         try:
+            frame = self._frame_q.get_nowait()
             if HAS_PIL:
-                img = Image.open(io.BytesIO(png))
-                img = img.resize((self.win_w, self.win_h), Image.BILINEAR)
-                self.photo = ImageTk.PhotoImage(img)
+                self.photo = ImageTk.PhotoImage(frame)
             else:
-                b64 = base64.b64encode(png).decode()
-                self.photo = tk.PhotoImage(data=b64)
-            self.redraw()
+                self.photo = tk.PhotoImage(data=frame)
+            self.canvas.itemconfig(self._img_id, image=self.photo)
+            self.canvas.delete("overlay")
+            if self.hint_mode:
+                self._draw_hints()
+            self._draw_cursor()
             self._idle_status()
-        except Exception as e:
-            self.status(f"image error: {e}")
-        if callback:
-            callback()
+        except queue.Empty:
+            pass
+        self.root.after(16, self._display_loop)
 
     # ── ADB actions ──────────────────────────────────────────────────────────
 
@@ -227,12 +236,10 @@ class KeyTap:
         self.cursor_x, self.cursor_y = dx, dy
         self.status(f"tap ({dx},{dy})")
         self.redraw()
-
-        def worker():
-            adb("shell", "input", "tap", str(dx), str(dy))
-            self.root.after(0, self.refresh)
-
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(
+            target=lambda: adb("shell", "input", "tap", str(dx), str(dy)),
+            daemon=True
+        ).start()
 
     def do_swipe(self, direction):
         cx, cy = self.cursor_x, self.cursor_y
@@ -247,13 +254,11 @@ class KeyTap:
             return
         x1, y1, x2, y2 = coords[direction]
         self.status(f"swipe {direction.lower()}")
-
-        def worker():
-            adb("shell", "input", "swipe",
-                str(x1), str(y1), str(x2), str(y2), str(self.SWIPE_MS))
-            self.root.after(0, self.refresh)
-
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(
+            target=lambda: adb("shell", "input", "swipe",
+                               str(x1), str(y1), str(x2), str(y2), str(self.SWIPE_MS)),
+            daemon=True
+        ).start()
 
     # ── Status ────────────────────────────────────────────────────────────────
 
@@ -329,8 +334,7 @@ class KeyTap:
             return
 
         if char in ('R',):
-            self.refresh()
-            return
+            return  # capture loop is continuous
 
         if char in ('S',):
             self.swipe_mode = True
@@ -360,11 +364,9 @@ class KeyTap:
     # ── Run ──────────────────────────────────────────────────────────────────
 
     def run(self):
-        self._loop()
+        threading.Thread(target=self._capture_loop, daemon=True).start()
+        self._display_loop()
         self.root.mainloop()
-
-    def _loop(self):
-        self.refresh(callback=self._loop)
 
 
 def main():
