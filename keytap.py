@@ -165,7 +165,6 @@ class KeyTap:
         for r in range(ARGS.rows):
             row_letter = string.ascii_uppercase[r] if r < 26 else None
             row_match = row_selected and row_letter and row_letter == typed[0]
-            is_cursor = CURSOR_MODE and r == self.cursor_row and c == self.cursor_col
 
             for c in range(ARGS.cols):
                 x0, y0 = int(c * cw), int(r * ch)
