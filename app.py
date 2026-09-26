@@ -436,6 +436,13 @@ class KeyTap:
         )
 
     def _on_palette_action(self, pkg, action):
+        if pkg == "__input-text__":
+            text = action
+            if not text:
+                return
+            self.status("input text")
+            self._run_adb("shell", "input", "text", text.replace(" ", "%s"))
+            return
         if pkg == "__clipboard__":
             text = action  # action holds the clipboard string
             if not text:
@@ -474,6 +481,9 @@ class KeyTap:
         elif action == "litmus":
             self.status(f"reading litmus {pkg}...")
             threading.Thread(target=lambda p=pkg: self._fetch_litmus(p), daemon=True).start()
+        elif action == "permissions":
+            self.status(f"reading permissions {pkg}...")
+            threading.Thread(target=lambda p=pkg: self._fetch_permissions(p), daemon=True).start()
 
     # ── Shared Prefs / Remote Config viewer ──────────────────────────────────
 
@@ -531,6 +541,42 @@ class KeyTap:
         except Exception as e:
             items = [("error", str(e))]
         self.root.after(0, lambda: self._on_viewer_loaded("Remote Config", items))
+
+    def _fetch_permissions(self, pkg, _refresh=False):
+        items = []
+        try:
+            out = adb("shell", "dumpsys", "package", pkg).stdout.decode()
+            for line in out.splitlines():
+                s = line.strip()
+                if ": granted=" in s:
+                    perm, rest = s.split(": granted=", 1)
+                    granted = rest.split(",")[0].strip() == "true"
+                    items.append((perm.strip(), "GRANTED" if granted else "DENIED"))
+        except Exception as e:
+            items = [("error", str(e))]
+
+        def on_select(perm, state):
+            if state.startswith("GRANTED"):
+                self._run_adb("shell", "pm", "revoke", pkg, perm)
+                self.status(f"revoked {perm}")
+            else:
+                self._run_adb("shell", "pm", "grant", pkg, perm)
+                self.status(f"granted {perm}")
+            threading.Timer(
+                0.6, lambda p=pkg: self._refresh_permissions(p)
+            ).start()
+
+        if _refresh:
+            self.root.after(0, lambda i=items: self._on_permissions_refresh(i))
+        else:
+            self.root.after(0, lambda: self._on_viewer_loaded("Permissions", items, on_select=on_select))
+
+    def _refresh_permissions(self, pkg):
+        self._fetch_permissions(pkg, _refresh=True)
+
+    def _on_permissions_refresh(self, items):
+        if self._palette and self._palette.win.winfo_exists():
+            self._palette.update_viewer_items(items)
 
     def _fetch_litmus(self, pkg):
         items = []

@@ -22,6 +22,7 @@ class CommandPalette:
         ("  Shared Prefs",  "shared-prefs"),
         ("  Remote Config", "remote-config"),
         ("  Litmus",        "litmus"),
+        ("  Permissions",   "permissions"),
     ]
 
     def __init__(self, parent, packages, on_action, clipboard_text="", deeplink_history=None):
@@ -90,6 +91,8 @@ class CommandPalette:
     def _on_query_change(self):
         if self._state == "viewer":
             self._filter_viewer(self._var.get())
+        elif self._state == "input":
+            pass  # free-text entry, no filtering
         else:
             self._filter(self._var.get())
 
@@ -104,6 +107,8 @@ class CommandPalette:
             self._virtual.append((f"  Launch: {q}", "deeplink", q))
             self._pkg_filtered = []
         else:
+            if not ql or ql in "input text":
+                self._virtual.append(("  Input Text — type to send to device", "input-text", ""))
             if ql and ql in "clipboard":
                 preview = (self._clipboard_text[:60].replace('\n', ' ')
                            if self._clipboard_text else "(empty)")
@@ -147,6 +152,12 @@ class CommandPalette:
         return "break"
 
     def _select(self, _e=None):
+        if self._state == "input":
+            text = self._var.get()
+            if text:
+                self._on_action("__input-text__", text)
+                self._close()
+            return "break"
         if self._state == "viewer":
             if self._viewer_on_select:
                 cur = self._listbox.curselection()
@@ -161,8 +172,11 @@ class CommandPalette:
             idx = cur[0]
             if idx < len(self._virtual):
                 _, vtype, vvalue = self._virtual[idx]
-                self._on_action(f"__{vtype}__", vvalue)
-                self._close()
+                if vtype == "input-text":
+                    self._show_input_mode()
+                else:
+                    self._on_action(f"__{vtype}__", vvalue)
+                    self._close()
             else:
                 pkg_idx = idx - len(self._virtual)
                 if pkg_idx < len(self._pkg_filtered):
@@ -197,7 +211,7 @@ class CommandPalette:
         if not cur:
             return
         _, action = self.ACTIONS[cur[0]]
-        if action in ("shared-prefs", "remote-config", "litmus"):
+        if action in ("shared-prefs", "remote-config", "litmus", "permissions"):
             self._enter_loading(action)
             self._on_action(self._selected_pkg, action)
         else:
@@ -237,13 +251,36 @@ class CommandPalette:
         n = len(self._viewer_shown)
         self._footer.set(f"{self._viewer_title} — {n} keys  |  type to search{hint}  Esc=back")
 
+    def update_viewer_items(self, items):
+        """Refresh viewer items in-place, preserving search query and selection."""
+        cur = self._listbox.curselection()
+        saved_idx = cur[0] if cur else 0
+        self._viewer_items = items
+        self._filter_viewer(self._var.get())
+        n = self._listbox.size()
+        if n:
+            idx = min(saved_idx, n - 1)
+            self._listbox.selection_set(idx)
+            self._listbox.see(idx)
+
     def _back_to_actions(self):
         self.win.resizable(False, False)
         self.win.geometry(f"{self.W}x{self.H}")
         self._show_actions(self._selected_pkg)
 
+    def _show_input_mode(self):
+        self._state = "input"
+        self._var.set("")
+        self._listbox.delete(0, tk.END)
+        self._listbox.insert(tk.END, "  (type text and press Enter to send to device)")
+        self._entry.config(state="normal")
+        self._entry.focus_set()
+        self._footer.set("Type text  |  Enter=send to device  Esc=back")
+
     def _on_esc(self, _e=None):
-        if self._state == "viewer":
+        if self._state == "input":
+            self._back_to_search()
+        elif self._state == "viewer":
             self._back_to_actions()
         elif self._state == "actions":
             self._back_to_search()
