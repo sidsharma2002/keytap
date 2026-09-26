@@ -24,7 +24,7 @@ class GridRenderer:
                 pass
         return ImageFont.load_default()
 
-    def composite(self, frame, cursor_row, cursor_col, input_buf):
+    def composite(self, frame, cursor_row, cursor_col, input_buf, elements=None):
         base = frame.convert("RGBA")
         overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
@@ -64,7 +64,30 @@ class GridRenderer:
                     draw.rectangle([x0 + 1, y0 + 1, x1 - 2, y1 - 2],
                                    outline=(0, 255, 80, 255), width=2)
 
+        if elements:
+            self._draw_elements(draw, elements)
+
         return Image.alpha_composite(base, overlay).convert("RGB")
+
+    def _draw_elements(self, draw, elements):
+        for el in elements:
+            x1, y1, x2, y2 = el['wx1'], el['wy1'], el['wx2'], el['wy2']
+            color = (0, 210, 255, 220) if el['clickable'] else (160, 160, 255, 180)
+            draw.rectangle([x1, y1, x2, y2], fill=(0, 210, 255, 18))
+            draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
+            self._draw_element_label(draw, x1, y1, el['label'], color)
+
+    def _draw_element_label(self, draw, x0, y0, label, color):
+        pad = 3
+        try:
+            bbox = self.font.getbbox(label)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        except AttributeError:
+            tw, th = len(label) * 7, 10
+        px0, py0 = x0 + 2, y0 + 2
+        px1, py1 = px0 + tw + pad * 2, py0 + th + pad * 2
+        draw.rectangle([px0, py0, px1, py1], fill=(0, 0, 0, 210))
+        draw.text((px0 + pad, py0 + pad), label, fill=color, font=self.font)
 
     def _draw_pill(self, draw, x0, y0, label, active=False):
         pad = 3

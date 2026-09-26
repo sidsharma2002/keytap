@@ -20,16 +20,19 @@ class KeyTap:
         self.win_w  = int(dev_w * self.scale)
         self.win_h  = ARGS.height
 
-        self.input_buf       = []
-        self.cursor_row      = 0
-        self.cursor_col      = 0
-        self.photo           = None
-        self._raw_frame      = None
-        self._last_scroll_t  = 0.0
-        self._last_shift_t   = 0.0
-        self._packages       = []
-        self._packages_ready = False
-        self._palette        = None
+        self.input_buf        = []
+        self.cursor_row       = 0
+        self.cursor_col       = 0
+        self.photo            = None
+        self._raw_frame       = None
+        self._last_scroll_t   = 0.0
+        self._last_shift_t    = 0.0
+        self._packages        = []
+        self._packages_ready  = False
+        self._palette         = None
+        self._elements        = []
+        self._element_mode    = False
+        self._element_loading = False
 
         self._build_ui()
 
@@ -83,7 +86,18 @@ class KeyTap:
     # ── Display ───────────────────────────────────────────────────────────────
 
     def _push_frame(self, frame):
-        composited = self._renderer.composite(frame, self.cursor_row, self.cursor_col, self.input_buf)
+        win_elements = None
+        if self._element_mode and self._elements:
+            s = self.scale
+            win_elements = [
+                {**el,
+                 'wx1': int(el['x1'] * s), 'wy1': int(el['y1'] * s),
+                 'wx2': int(el['x2'] * s), 'wy2': int(el['y2'] * s)}
+                for el in self._elements
+            ]
+        composited = self._renderer.composite(
+            frame, self.cursor_row, self.cursor_col, self.input_buf, win_elements
+        )
         self.photo = ImageTk.PhotoImage(composited)
         self.canvas.itemconfig(self._img_id, image=self.photo)
 
@@ -107,6 +121,12 @@ class KeyTap:
         self.status_var.set(msg)
 
     def _idle_status(self):
+        if self._element_mode:
+            n = len(self._elements)
+            self.status(
+                f"element mode: {n} elements  |  a-z=tap element  arrows=move  e=exit"
+            )
+            return
         if CURSOR_MODE:
             r, c = self.cursor_row, self.cursor_col
             row_label = string.ascii_uppercase[r] if r < 26 else str(r + 1)
@@ -163,6 +183,25 @@ class KeyTap:
         sym  = event.keysym
         char = event.char.upper() if event.char else ""
         step = CURSOR_JUMP if bool(event.state & 0x1) else 1
+
+        # E: toggle element overlay (takes priority always)
+        if char == 'E':
+            self._exit_element_mode() if self._element_mode else self._enter_element_mode()
+            return
+
+        # Element mode: letters select elements, arrows still move cursor
+        if self._element_mode:
+            moved = False
+            if sym == 'Up':    self.cursor_row = max(0, self.cursor_row - step); moved = True
+            elif sym == 'Down':  self.cursor_row = min(ARGS.rows - 1, self.cursor_row + step); moved = True
+            elif sym == 'Left':  self.cursor_col = max(0, self.cursor_col - step); moved = True
+            elif sym == 'Right': self.cursor_col = min(ARGS.cols - 1, self.cursor_col + step); moved = True
+            elif char and char.isalpha():
+                self._tap_element(char.lower())
+            if moved:
+                self.redraw()
+                self._idle_status()
+            return
 
         if sym == 'Up':
             self.cursor_row = max(0, self.cursor_row - step)
@@ -232,6 +271,49 @@ class KeyTap:
             self._handle_cursor_key(event)
         else:
             self._handle_label_key(sym, event.char.upper() if event.char else "")
+
+    # ── Element overlay ──────────────────────────────────────────────────────
+
+    def _enter_element_mode(self):
+        if self._element_loading:
+            return
+        self._element_loading = True
+        self.status("dumping UI hierarchy...")
+        threading.Thread(target=self._fetch_elements, daemon=True).start()
+
+    def _fetch_elements(self):
+        try:
+            from elements import dump_elements
+            els = dump_elements(ARGS.serial)
+            self.root.after(0, lambda e=els: self._on_elements_loaded(e))
+        except Exception as ex:
+            self.root.after(0, lambda m=str(ex): self._on_element_error(m))
+
+    def _on_elements_loaded(self, elements):
+        self._element_loading = False
+        self._elements = elements
+        self._element_mode = True
+        self.redraw()
+        self._idle_status()
+
+    def _on_element_error(self, msg):
+        self._element_loading = False
+        self.status(f"element dump failed: {msg}")
+
+    def _exit_element_mode(self):
+        self._elements = []
+        self._element_mode = False
+        self.redraw()
+        self._idle_status()
+
+    def _tap_element(self, char):
+        for el in self._elements:
+            if el['label'] == char:
+                self.do_tap(el['cx'], el['cy'])
+                hint = el['text'] or el['resource_id'] or el['label']
+                self.status(f"tap '{hint}' ({el['cx']},{el['cy']})")
+                return
+        self.status(f"no element '{char}'")
 
     # ── Command palette ──────────────────────────────────────────────────────
 
