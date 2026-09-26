@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
 """
-keytap - Android mirror with keyboard control
-Screencap-based mirror + Vimium-style grid hints + arrow cursor.
+keytap - Android mirror with always-on grid overlay
 
 Controls:
-  f            hint mode (grid labels appear instantly)
-  A1..J4       tap that cell
-  Esc          cancel hint / quit
-  arrows       move cursor (Shift=fast, Option=fine)
-  Space        tap at cursor
-  s + arrow    swipe direction
-  r            refresh screencap
+  A1..J8       tap that cell (type row letter then column number)
+  Backspace    clear input buffer
+  Esc          quit
 
 Usage:
   python3 keytap.py
@@ -79,12 +74,6 @@ def take_screencap():
 
 
 class KeyTap:
-    STEP_NORMAL = 50
-    STEP_FAST   = 200
-    STEP_FINE   = 10
-    SWIPE_DIST  = 700
-    SWIPE_MS    = 300
-
     def __init__(self, dev_w, dev_h):
         self.dev_w = dev_w
         self.dev_h = dev_h
@@ -92,14 +81,9 @@ class KeyTap:
         self.win_w  = int(dev_w * self.scale)
         self.win_h  = ARGS.height
 
-        self.cursor_x = dev_w // 2
-        self.cursor_y = dev_h // 2
-
-        self.hint_mode  = False
-        self.hint_buf   = []
-        self.swipe_mode = False
-        self.photo      = None
-        self._frame_q   = queue.Queue(maxsize=1)
+        self.input_buf = []
+        self.photo     = None
+        self._frame_q  = queue.Queue(maxsize=1)
 
         self._build_ui()
 
@@ -132,9 +116,6 @@ class KeyTap:
 
     # ── Coordinate helpers ────────────────────────────────────────────────────
 
-    def to_win(self, dx, dy):
-        return int(dx * self.scale), int(dy * self.scale)
-
     def cell_to_dev(self, label):
         r = string.ascii_uppercase.index(label[0])
         c = int(label[1]) - 1
@@ -149,26 +130,13 @@ class KeyTap:
     def redraw(self):
         self.canvas.itemconfig(self._img_id, image=self.photo or "")
         self.canvas.delete("overlay")
-        if self.hint_mode:
-            self._draw_hints()
-        self._draw_cursor()
+        self._draw_grid()
 
-    def _draw_cursor(self):
-        cx, cy = self.to_win(self.cursor_x, self.cursor_y)
-        color = "#FF4444" if self.hint_mode else "#00FF88"
-        arm = 14
-        t = "overlay"
-        self.canvas.create_line(cx - arm, cy, cx + arm, cy, fill="black", width=3, tags=t)
-        self.canvas.create_line(cx, cy - arm, cx, cy + arm, fill="black", width=3, tags=t)
-        self.canvas.create_line(cx - arm, cy, cx + arm, cy, fill=color,   width=1, tags=t)
-        self.canvas.create_line(cx, cy - arm, cx, cy + arm, fill=color,   width=1, tags=t)
-        self.canvas.create_oval(cx-3, cy-3, cx+3, cy+3, fill=color, outline="", tags=t)
-
-    def _draw_hints(self):
+    def _draw_grid(self):
         cw = self.win_w / ARGS.cols
         ch = self.win_h / ARGS.rows
         fs = max(9, int(min(cw, ch) // 4))
-        typed = ''.join(self.hint_buf).upper()
+        typed = ''.join(self.input_buf).upper()
 
         for r in range(ARGS.rows):
             for c in range(ARGS.cols):
@@ -179,7 +147,7 @@ class KeyTap:
 
                 active = typed and label.startswith(typed)
                 line_color  = "#FFD700" if active else "#FFFFFF"
-                label_color = "#FFD700"
+                label_color = "#FFD700" if active else "#AAAAAA"
 
                 self.canvas.create_rectangle(
                     x0, y0, x1, y1,
@@ -292,9 +260,7 @@ class KeyTap:
                 self.photo = tk.PhotoImage(data=frame)
             self.canvas.itemconfig(self._img_id, image=self.photo)
             self.canvas.delete("overlay")
-            if self.hint_mode:
-                self._draw_hints()
-            self._draw_cursor()
+            self._draw_grid()
             self._idle_status()
         except queue.Empty:
             pass
@@ -303,30 +269,9 @@ class KeyTap:
     # ── ADB actions ──────────────────────────────────────────────────────────
 
     def do_tap(self, dx, dy):
-        self.cursor_x, self.cursor_y = dx, dy
         self.status(f"tap ({dx},{dy})")
-        self.redraw()
         threading.Thread(
             target=lambda: adb("shell", "input", "tap", str(dx), str(dy)),
-            daemon=True
-        ).start()
-
-    def do_swipe(self, direction):
-        cx, cy = self.cursor_x, self.cursor_y
-        d = self.SWIPE_DIST
-        coords = {
-            'Up':    (cx, cy, cx, cy - d),
-            'Down':  (cx, cy, cx, cy + d),
-            'Left':  (cx, cy, cx - d, cy),
-            'Right': (cx, cy, cx + d, cy),
-        }
-        if direction not in coords:
-            return
-        x1, y1, x2, y2 = coords[direction]
-        self.status(f"swipe {direction.lower()}")
-        threading.Thread(
-            target=lambda: adb("shell", "input", "swipe",
-                               str(x1), str(y1), str(x2), str(y2), str(self.SWIPE_MS)),
             daemon=True
         ).start()
 
@@ -336,10 +281,11 @@ class KeyTap:
         self.status_var.set(msg)
 
     def _idle_status(self):
-        if self.hint_mode:
-            self.status(f"hint: {''.join(self.hint_buf) or '_'}  (Esc=cancel)")
+        buf = ''.join(self.input_buf).upper()
+        if buf:
+            self.status(f"typing: {buf}_  (Backspace=clear)")
         else:
-            self.status("f=hints  arrows=move  space=tap  s+arrow=swipe  r=refresh  Esc=quit")
+            self.status("type cell label to tap (e.g. A1, B3)  |  Esc=quit")
 
     # ── Key handler ──────────────────────────────────────────────────────────
 
@@ -347,89 +293,34 @@ class KeyTap:
         sym  = event.keysym
         char = event.char.upper() if event.char else ""
 
-        shift  = bool(event.state & 0x1)
-        option = bool(event.state & 0x8)
-
-        # ── swipe mode (after pressing s) ────────────────────────────────
-        if self.swipe_mode:
-            self.swipe_mode = False
-            if sym in ('Up', 'Down', 'Left', 'Right'):
-                self.do_swipe(sym)
-            else:
-                self.status("swipe cancelled")
-            return
-
-        # ── hint mode ────────────────────────────────────────────────────
-        if self.hint_mode:
-            if sym == 'Escape':
-                self.hint_mode = False
-                self.hint_buf.clear()
-                self.redraw()
-                self._idle_status()
-                return
-            if sym == 'BackSpace' and self.hint_buf:
-                self.hint_buf.pop()
-                self.redraw()
-                self._idle_status()
-                return
-            if char.isalpha() and not self.hint_buf:
-                self.hint_buf.append(char)
-                self.redraw()
-                self._idle_status()
-                return
-            if char.isdigit() and len(self.hint_buf) == 1:
-                self.hint_buf.append(char)
-                label = ''.join(self.hint_buf)
-                self.hint_mode = False
-                self.hint_buf.clear()
-                try:
-                    dx, dy = self.cell_to_dev(label)
-                    self.do_tap(dx, dy)
-                except ValueError:
-                    self.status(f"'{label}' out of range")
-                    self.redraw()
-                return
-            return
-
-        # ── normal mode ──────────────────────────────────────────────────
         if sym == 'Escape':
             self.root.destroy()
             return
 
-        if char in ('F',):
-            self.hint_mode = True
-            self.hint_buf.clear()
+        if sym == 'BackSpace':
+            if self.input_buf:
+                self.input_buf.pop()
+                self.redraw()
+                self._idle_status()
+            return
+
+        if char.isalpha() and not self.input_buf:
+            self.input_buf.append(char)
             self.redraw()
             self._idle_status()
             return
 
-        if char in ('R',):
-            return  # capture loop is continuous
-
-        if char in ('S',):
-            self.swipe_mode = True
-            self.status("swipe: press arrow key")
+        if char.isdigit() and len(self.input_buf) == 1:
+            self.input_buf.append(char)
+            label = ''.join(self.input_buf)
+            self.input_buf.clear()
+            try:
+                dx, dy = self.cell_to_dev(label)
+                self.do_tap(dx, dy)
+            except ValueError:
+                self.status(f"'{label}' out of range")
+            self.redraw()
             return
-
-        if sym == 'space':
-            self.do_tap(self.cursor_x, self.cursor_y)
-            return
-
-        # cursor movement
-        step = self.STEP_FINE if option else (self.STEP_FAST if shift else self.STEP_NORMAL)
-        if sym == 'Up':
-            self.cursor_y = max(0, self.cursor_y - step)
-        elif sym == 'Down':
-            self.cursor_y = min(self.dev_h, self.cursor_y + step)
-        elif sym == 'Left':
-            self.cursor_x = max(0, self.cursor_x - step)
-        elif sym == 'Right':
-            self.cursor_x = min(self.dev_w, self.cursor_x + step)
-        else:
-            return
-
-        self.redraw()
-        self.status(f"cursor ({self.cursor_x},{self.cursor_y})")
 
     # ── Run ──────────────────────────────────────────────────────────────────
 
