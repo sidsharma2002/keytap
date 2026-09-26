@@ -1,5 +1,8 @@
 import sys
+import os
+import json
 import string
+import subprocess
 import tkinter as tk
 from PIL import ImageTk, ImageChops
 import threading
@@ -31,6 +34,7 @@ class KeyTap:
         self._packages        = []
         self._packages_ready  = False
         self._palette         = None
+        self._deeplink_history = []
         self._elements        = []
         self._element_mode    = False
         self._element_loading = False
@@ -337,7 +341,7 @@ class KeyTap:
     def _check_screen_change(self, frame):
         if self._elem_ref_frame is None:
             return
-        if time.time() - self._elem_last_dump_t < 1.5:
+        if time.time() - self._elem_last_dump_t < 0.5:
             return
         small = frame.resize((90, 200))
         ref   = self._elem_ref_frame.resize((90, 200))
@@ -391,6 +395,28 @@ class KeyTap:
         )
         self._packages_ready = True
 
+    _DEEPLINK_HISTORY_PATH = os.path.expanduser("~/.keytap_deeplinks.json")
+
+    def _load_deeplink_history(self):
+        try:
+            with open(self._DEEPLINK_HISTORY_PATH) as f:
+                self._deeplink_history = json.load(f)
+        except Exception:
+            self._deeplink_history = []
+
+    def _save_deeplink_history(self):
+        try:
+            with open(self._DEEPLINK_HISTORY_PATH, "w") as f:
+                json.dump(self._deeplink_history, f)
+        except Exception:
+            pass
+
+    def _read_clipboard(self):
+        try:
+            return subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=1).stdout
+        except Exception:
+            return ""
+
     def _open_palette(self):
         if self._palette and self._palette.win.winfo_exists():
             self._palette.win.lift()
@@ -399,10 +425,33 @@ class KeyTap:
         if not self._packages_ready:
             self.status("package list still loading...")
             return
-        self._palette = CommandPalette(self.root, self._packages,
-                                       on_action=self._on_palette_action)
+        self._palette = CommandPalette(
+            self.root, self._packages,
+            on_action=self._on_palette_action,
+            clipboard_text=self._read_clipboard(),
+            deeplink_history=self._deeplink_history,
+        )
 
     def _on_palette_action(self, pkg, action):
+        if pkg == "__clipboard__":
+            text = action  # action holds the clipboard string
+            if not text:
+                self.status("clipboard empty")
+                return
+            self.status("paste clipboard")
+            self._run_adb("shell", "input", "text", text.replace(" ", "%s"))
+            return
+        if pkg == "__deeplink__":
+            url = action
+            self.status(f"launch {url}")
+            self._run_adb("shell", "am", "start", "-a",
+                          "android.intent.action.VIEW", "-d", url)
+            if url in self._deeplink_history:
+                self._deeplink_history.remove(url)
+            self._deeplink_history.insert(0, url)
+            self._deeplink_history = self._deeplink_history[:20]
+            threading.Thread(target=self._save_deeplink_history, daemon=True).start()
+            return
         self.status(f"{action} {pkg}")
         if action == "launch":
             self._run_adb("shell", "monkey", "-p", pkg,
@@ -417,6 +466,7 @@ class KeyTap:
     # ── Run ──────────────────────────────────────────────────────────────────
 
     def run(self):
+        self._load_deeplink_history()
         threading.Thread(target=self._fetch_packages, daemon=True).start()
         self._capture.start()
         self._display_loop()

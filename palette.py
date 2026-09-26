@@ -1,4 +1,7 @@
+import re
 import tkinter as tk
+
+_DEEPLINK_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9+\-.]*://.+')
 
 
 class CommandPalette:
@@ -18,12 +21,15 @@ class CommandPalette:
         ("  Uninstall",   "uninstall"),
     ]
 
-    def __init__(self, parent, packages, on_action):
-        self._packages     = packages
-        self._filtered     = list(packages)
-        self._on_action    = on_action
-        self._state        = "search"   # "search" | "actions"
-        self._selected_pkg = None
+    def __init__(self, parent, packages, on_action, clipboard_text="", deeplink_history=None):
+        self._packages         = packages
+        self._on_action        = on_action
+        self._state            = "search"   # "search" | "actions"
+        self._selected_pkg     = None
+        self._clipboard_text   = clipboard_text
+        self._deeplink_history = deeplink_history or []
+        self._virtual          = []   # [(display_str, type, value), ...]
+        self._pkg_filtered     = list(packages)
 
         self.win = tk.Toplevel(parent)
         self.win.title("keytap — launch app")
@@ -79,14 +85,38 @@ class CommandPalette:
         self.win.bind("<Escape>", self._on_esc)
 
     def _filter(self, query):
-        q = query.strip().lower()
-        self._filtered = [p for p in self._packages if q in p.lower()] if q else list(self._packages)
+        q  = query.strip()
+        ql = q.lower()
+
+        self._virtual = []
+
+        if _DEEPLINK_RE.match(q):
+            # Deep link typed directly — show launch entry, skip package search
+            self._virtual.append((f"  Launch: {q}", "deeplink", q))
+            self._pkg_filtered = []
+        else:
+            if ql and ql in "clipboard":
+                preview = (self._clipboard_text[:60].replace('\n', ' ')
+                           if self._clipboard_text else "(empty)")
+                self._virtual.append((f"  Clipboard — {preview}", "clipboard", self._clipboard_text))
+            if ql and ql in "deeplink":
+                for url in self._deeplink_history[:10]:
+                    self._virtual.append((f"  Link: {url}", "deeplink", url))
+            self._pkg_filtered = (
+                [p for p in self._packages if ql in p.lower()] if ql
+                else list(self._packages)
+            )
+
         self._listbox.delete(0, tk.END)
-        for pkg in self._filtered[:60]:
+        for display, _, _ in self._virtual:
+            self._listbox.insert(tk.END, display)
+        for pkg in self._pkg_filtered[:60]:
             self._listbox.insert(tk.END, f"  {pkg}")
-        if self._filtered:
+
+        total = len(self._virtual) + min(len(self._pkg_filtered), 60)
+        if total:
             self._listbox.selection_set(0)
-            self._footer.set(f"{len(self._filtered)} packages  |  Enter=select  Esc=close")
+            self._footer.set(f"{total} results  |  Enter=select  Esc=close")
         else:
             self._footer.set("no match")
 
@@ -109,10 +139,20 @@ class CommandPalette:
 
     def _select(self, _e=None):
         if self._state == "search":
-            pkg = self._filtered[self._listbox.curselection()[0]] if self._listbox.curselection() else None
-            if pkg:
-                self._selected_pkg = pkg
-                self._show_actions(pkg)
+            cur = self._listbox.curselection()
+            if not cur:
+                return "break"
+            idx = cur[0]
+            if idx < len(self._virtual):
+                _, vtype, vvalue = self._virtual[idx]
+                self._on_action(f"__{vtype}__", vvalue)
+                self._close()
+            else:
+                pkg_idx = idx - len(self._virtual)
+                if pkg_idx < len(self._pkg_filtered):
+                    pkg = self._pkg_filtered[pkg_idx]
+                    self._selected_pkg = pkg
+                    self._show_actions(pkg)
         else:
             self._execute_action()
         return "break"

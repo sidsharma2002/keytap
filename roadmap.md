@@ -87,6 +87,60 @@ Pre-defined name → ADB command. Fuzzy match on name.
 
 ---
 
+## Developer Utilities
+
+### Tier 1 — Zero/low effort, daily use
+
+**Current activity in status bar**
+- Always-on: `adb shell dumpsys activity | grep mResumedActivity` polled every ~2s
+- Show `com.example/.LoginActivity` in status bar
+- Near-free; constantly useful for navigation + debugging
+
+**Mac → device clipboard paste**
+- `t` key reads Mac clipboard via `pbpaste`, pipes to `adb shell input text "..."`
+- Eliminates typing emails/tokens/URLs on device
+
+**Screenshot to desktop**
+- Single key saves `~/Desktop/keytap_YYYYMMDD_HHMMSS.png`
+- `adb exec-out screencap -p` → timestamped file
+- Already half-wired in palette; promote to dedicated hotkey
+
+**Notification shade toggle**
+- `n` key → `adb shell input swipe 500 0 500 1000`
+- Open/close notification drawer without touching device
+
+### Tier 2 — Moderate effort, high developer value
+
+**Logcat tail overlay**
+- Toggleable pane (bottom 20% of window) streaming `adb logcat -v brief`
+- Filter by foreground package automatically
+- Eliminates terminal switching during debugging sessions
+
+**Deep link / intent launcher**
+- Palette: type `deep myapp://reset` → `adb shell am start -a android.intent.action.VIEW -d "myapp://reset"`
+- Common for feature testing and QA flows
+
+**Permission manager**
+- Palette → pick package → list DANGEROUS permissions → grant/revoke inline
+- `adb shell pm grant/revoke <pkg> <permission>`
+- Common in onboarding flow testing
+
+### Tier 3 — High effort, niche but powerful
+
+**ADB WiFi toggle**
+- `adb tcpip 5555` + `adb connect <device-ip>` → wireless debugging
+- Auto-detect device IP from `adb shell ip route`
+
+**Tap recorder → adb script**
+- Record sequence of taps/swipes → export as shell script with `sleep` between steps
+- Lightweight regression macro without uiautomator2 fragility
+
+**Font scale / display density toggle**
+- `adb shell settings put system font_scale 1.3` quick toggle
+- Test accessibility without digging into device settings
+
+---
+
 ## uiautomator2 (Element-Aware Mode)
 
 Uses the `uiautomator2` Python library which runs a persistent agent on device. UI hierarchy dump is ~50-200ms vs 500ms+ for `adb shell uiautomator dump`. Enables element-driven tapping instead of coordinate-driven.
@@ -138,13 +192,23 @@ Uses the `uiautomator2` Python library which runs a persistent agent on device. 
 5. u2 element overlay — draw real element bounds on mirror, tap by label
 6. u2 element search in palette — search visible UI elements by text
 7. u2 context status bar — show element info on cursor hover
-8. Ghost dot on last tap — immediate visual feedback, eliminates guessing
-9. Long press (`Space` hold)
-10. Smart text input (`t` key / u2 EditText detection)
-11. Smart scroll (u2 scrollable container detection)
-12. Bookmarks + undo history
-13. Grid density toggle (`+` / `-`)
-14. Grid visibility toggle (`o`)
-15. Always-on-top window
-16. u2 wait/assert
-17. u2 record + replay
+8. Current activity in status bar — always-on, near-free developer info
+9. Mac → device clipboard paste — removes biggest text input friction
+10. Logcat tail overlay — eliminates terminal switching during debugging
+11. Ghost dot on last tap — immediate visual feedback, eliminates guessing
+12. Notification shade toggle (`n` key)
+13. Screenshot to desktop (dedicated hotkey)
+14. Deep link / intent launcher (in palette)
+15. Long press (`Space` hold)
+16. Smart text input (`t` key / u2 EditText detection)
+17. Smart scroll (u2 scrollable container detection)
+18. Permission manager (in palette)
+19. Bookmarks + undo history
+20. Grid density toggle (`+` / `-`)
+21. Grid visibility toggle (`o`)
+22. Always-on-top window
+23. Font scale / density quick toggle
+24. ADB WiFi toggle
+25. Tap recorder → adb script export
+26. u2 wait/assert
+27. u2 record + replay
