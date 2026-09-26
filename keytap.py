@@ -83,13 +83,14 @@ class KeyTap:
         self.win_w  = int(dev_w * self.scale)
         self.win_h  = ARGS.height
 
-        self.input_buf  = []
-        self.cursor_row = 0
-        self.cursor_col = 0
-        self.photo      = None
-        self._raw_frame = None
-        self._frame_q   = queue.Queue(maxsize=1)
-        self._grid_font = self._load_grid_font()
+        self.input_buf      = []
+        self.cursor_row     = 0
+        self.cursor_col     = 0
+        self.photo          = None
+        self._raw_frame     = None
+        self._frame_q       = queue.Queue(maxsize=1)
+        self._grid_font     = self._load_grid_font()
+        self._last_scroll_t = 0.0
 
         self._build_ui()
 
@@ -368,6 +369,14 @@ class KeyTap:
             daemon=True
         ).start()
 
+    def do_swipe(self, x1, y1, x2, y2, duration=300, label="swipe"):
+        self.status(f"{label} ({x1},{y1})→({x2},{y2})")
+        threading.Thread(
+            target=lambda: adb("shell", "input", "swipe",
+                               str(x1), str(y1), str(x2), str(y2), str(duration)),
+            daemon=True
+        ).start()
+
     # ── Status ────────────────────────────────────────────────────────────────
 
     def status(self, msg):
@@ -378,7 +387,7 @@ class KeyTap:
             r, c = self.cursor_row, self.cursor_col
             row_label = string.ascii_uppercase[r] if r < 26 else str(r + 1)
             col_label = string.ascii_uppercase[c]
-            self.status(f"cursor: {row_label}{col_label} (row {r+1}, col {c+1})  |  arrows=move  Shift=jump5  space=tap  b=back  h=home  r=recents  Esc=quit")
+            self.status(f"cursor: {row_label}{col_label} (row {r+1}, col {c+1})  |  arrows=move  Shift=jump5  space=tap  w/s=scroll  b=back  h=home  r=recents  Esc=quit")
         else:
             buf = ''.join(self.input_buf).upper()
             cols_range = string.ascii_uppercase[:ARGS.cols]
@@ -421,6 +430,24 @@ class KeyTap:
                 return
             elif char == 'R':
                 self.do_keyevent(187, "recents")
+                return
+            elif char in ('W', 'S'):
+                now = time.time()
+                if now - self._last_scroll_t < 0.4:
+                    return  # throttle: swipe still in flight, ignore repeat
+                self._last_scroll_t = now
+                cx, cy = self.cell_to_dev_rc(self.cursor_row, self.cursor_col)
+                dist = int(self.dev_h * 0.4)
+                if char == 'W':
+                    # scroll up: drag finger down → reveals items above
+                    y1 = max(cy - dist // 2, 0)
+                    y2 = min(cy + dist // 2, self.dev_h - 1)
+                    self.do_swipe(cx, y1, cx, y2, label="scroll up")
+                else:
+                    # scroll down: drag finger up → reveals items below
+                    y1 = min(cy + dist // 2, self.dev_h - 1)
+                    y2 = max(cy - dist // 2, 0)
+                    self.do_swipe(cx, y1, cx, y2, label="scroll down")
                 return
             else:
                 return
