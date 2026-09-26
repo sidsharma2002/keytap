@@ -34,6 +34,7 @@ except ImportError:
     HAS_PIL = False
 
 ADB_PATH   = "/Users/sidharthsharma/Library/Android/sdk/platform-tools/adb"
+CURSOR_MODE = True   # True = arrow-key cursor; False = 2-letter label typing
 FIFO_PATH  = "/tmp/keytap_stream.fifo"
 HAS_SCRCPY = shutil.which("scrcpy") is not None
 HAS_FFMPEG = shutil.which("ffmpeg") is not None
@@ -43,7 +44,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--serial", default=None, help="ADB serial (e.g. emulator-5554)")
     p.add_argument("--cols",   type=int, default=10)
-    p.add_argument("--rows",   type=int, default=16)
+    p.add_argument("--rows",   type=int, default=32)
     p.add_argument("--height", type=int, default=800, help="mirror window height px")
     return p.parse_args()
 
@@ -82,6 +83,8 @@ class KeyTap:
         self.win_h  = ARGS.height
 
         self.input_buf  = []
+        self.cursor_row = 0
+        self.cursor_col = 0
         self.photo      = None
         self._raw_frame = None
         self._frame_q   = queue.Queue(maxsize=1)
@@ -123,6 +126,9 @@ class KeyTap:
         c = string.ascii_uppercase.index(label[1].upper())
         if r >= ARGS.rows or c >= ARGS.cols:
             raise ValueError("out of range")
+        return self.cell_to_dev_rc(r, c)
+
+    def cell_to_dev_rc(self, r, c):
         cw = self.dev_w / ARGS.cols
         ch = self.dev_h / ARGS.rows
         return int(c * cw + cw / 2), int(r * ch + ch / 2)
@@ -157,30 +163,38 @@ class KeyTap:
         row_selected = len(typed) == 1
 
         for r in range(ARGS.rows):
-            row_letter = string.ascii_uppercase[r]
-            row_match = row_selected and row_letter == typed[0]
+            row_letter = string.ascii_uppercase[r] if r < 26 else None
+            row_match = row_selected and row_letter and row_letter == typed[0]
+            is_cursor = CURSOR_MODE and r == self.cursor_row and c == self.cursor_col
 
             for c in range(ARGS.cols):
                 x0, y0 = int(c * cw), int(r * ch)
                 x1, y1 = int((c + 1) * cw), int((r + 1) * ch)
-                label = f"{row_letter}{string.ascii_uppercase[c]}"
+                is_cursor = CURSOR_MODE and r == self.cursor_row and c == self.cursor_col
+                label = f"{row_letter}{string.ascii_uppercase[c]}" if row_letter else None
 
                 if not typed:
-                    # Idle: faint lines + dim pills always visible
                     draw.rectangle([x0, y0, x1 - 1, y1 - 1],
                                    outline=(255, 255, 255, 38))
-                    self._draw_pill(draw, x0, y0, label, active=False)
+                    if label:
+                        self._draw_pill(draw, x0, y0, label, active=False)
                 elif row_match:
-                    # Active row: gold band + bright lines + bright pill
                     draw.rectangle([x0, y0, x1, y1], fill=(255, 215, 0, 28))
                     draw.rectangle([x0, y0, x1 - 1, y1 - 1],
                                    outline=(255, 215, 0, 200))
-                    self._draw_pill(draw, x0, y0, label, active=True)
+                    if label:
+                        self._draw_pill(draw, x0, y0, label, active=True)
                 else:
-                    # Inactive rows while typing: very faint lines + ghost pills
                     draw.rectangle([x0, y0, x1 - 1, y1 - 1],
                                    outline=(255, 255, 255, 15))
-                    self._draw_pill(draw, x0, y0, label, active=None)
+                    if label:
+                        self._draw_pill(draw, x0, y0, label, active=None)
+
+                # Cursor cell: green selection border + subtle fill
+                if is_cursor:
+                    draw.rectangle([x0, y0, x1, y1], fill=(0, 255, 80, 25))
+                    draw.rectangle([x0 + 1, y0 + 1, x1 - 2, y1 - 2],
+                                   outline=(0, 255, 80, 255), width=2)
 
         return Image.alpha_composite(base, overlay).convert("RGB")
 
@@ -353,13 +367,19 @@ class KeyTap:
         self.status_var.set(msg)
 
     def _idle_status(self):
-        buf = ''.join(self.input_buf).upper()
-        cols_range = string.ascii_uppercase[:ARGS.cols]
-        rows_range = string.ascii_uppercase[:ARGS.rows]
-        if len(buf) == 1:
-            self.status(f"row {buf} selected  →  type col ({cols_range[0]}-{cols_range[-1]})  |  Backspace=cancel")
+        if CURSOR_MODE:
+            r, c = self.cursor_row, self.cursor_col
+            row_label = string.ascii_uppercase[r] if r < 26 else str(r + 1)
+            col_label = string.ascii_uppercase[c]
+            self.status(f"cursor: {row_label}{col_label} (row {r+1}, col {c+1})  |  arrows=move  space=tap  Esc=quit")
         else:
-            self.status(f"type row ({rows_range[0]}-{rows_range[-1]}) then col ({cols_range[0]}-{cols_range[-1]})  |  Esc=quit")
+            buf = ''.join(self.input_buf).upper()
+            cols_range = string.ascii_uppercase[:ARGS.cols]
+            rows_range = string.ascii_uppercase[:min(ARGS.rows, 26)]
+            if len(buf) == 1:
+                self.status(f"row {buf} selected  →  type col ({cols_range[0]}-{cols_range[-1]})  |  Backspace=cancel")
+            else:
+                self.status(f"type row ({rows_range[0]}-{rows_range[-1]}) then col ({cols_range[0]}-{cols_range[-1]})  |  Esc=quit")
 
     # ── Key handler ──────────────────────────────────────────────────────────
 
@@ -371,6 +391,26 @@ class KeyTap:
             self.root.destroy()
             return
 
+        if CURSOR_MODE:
+            if sym == 'Up':
+                self.cursor_row = max(0, self.cursor_row - 1)
+            elif sym == 'Down':
+                self.cursor_row = min(ARGS.rows - 1, self.cursor_row + 1)
+            elif sym == 'Left':
+                self.cursor_col = max(0, self.cursor_col - 1)
+            elif sym == 'Right':
+                self.cursor_col = min(ARGS.cols - 1, self.cursor_col + 1)
+            elif sym == 'space':
+                dx, dy = self.cell_to_dev_rc(self.cursor_row, self.cursor_col)
+                self.do_tap(dx, dy)
+                return
+            else:
+                return
+            self.redraw()
+            self._idle_status()
+            return
+
+        # 2-letter label mode (active when CURSOR_MODE = False)
         if sym == 'BackSpace':
             if self.input_buf:
                 self.input_buf.pop()
