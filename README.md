@@ -1,93 +1,99 @@
 # keytap
 
-Keyboard-driven Android device controller. Mirror your Android screen and control it entirely from your Mac keyboard — no mouse, no touch.
+Control your Android device entirely from your keyboard. No mouse, no Android Studio, no background daemons. Pure Python + ADB.
 
-## What it does
+Built for mobile developers and QA engineers who want fast, scriptable device control without leaving the terminal.
 
-- Live screen mirror via scrcpy (falls back to ADB screencap)
-- Grid overlay: divide screen into cells, navigate with arrow keys, tap with Space
-- Element mode (`e`): dump UI hierarchy, overlay labeled bounding boxes, tap by typing 2-char label
-- Command palette (`Shift+Shift`): fuzzy search packages, launch/force-stop/clear/uninstall apps
-- Device shortcuts: `b`=back, `h`=home, `r`=recents, `w`/`s`=scroll
-- View hierarchy explorer with live bound preview
-- Memory Watchdog: GC pressure + process death risk from live ADB stats
-- Shared prefs, remote config, permission viewer/toggler
-- Clipboard paste, deep link launcher, screenshot
+---
+
+## Features
+
+### Control
+- **Grid navigation** — screen divided into a cell grid, move with arrow keys, tap with Space
+- **Fast jump** — Shift+Arrow jumps 5 cells at once
+- **Element tap** — press `e` to overlay labeled bounding boxes on every interactive element, type a 2-char label to tap it precisely
+
+### Inspect
+- **Layout Inspector** — live bounding box overlay on real UI elements with class, resource ID, and text labels
+- **View Hierarchy Explorer** — browse the full UI tree from the command palette, scroll through nodes, and see live bound highlights on screen as you navigate
+
+### Debug
+- **Memory Watchdog** — real-time GC pressure gauge and process death risk indicator for the foreground app, updated every 2s
+- **Shared Prefs Viewer** — browse and search all shared preference keys for any installed package
+- **Remote Config Viewer** — inspect remote config keys and values live, with search
+- **Permissions Manager** — view and toggle runtime permissions for any package
+
+### Command Palette (double Shift)
+- Fuzzy search all installed packages
+- **App actions**: launch, force stop, clear data, uninstall
+- **Deep link launcher** — fire any `scheme://path` directly to the device
+- **Clipboard paste** — paste Mac clipboard text into any device input field
+- **Screenshot** — save a timestamped screenshot to your desktop
+
+---
 
 ## Requirements
 
 ### System tools
 
-| Tool | Install |
-|---|---|
-| Python 3.9+ | `brew install python` |
-| ADB | Android SDK platform-tools, or `brew install android-platform-tools` |
-| scrcpy | `brew install scrcpy` (optional, improves frame rate) |
-| ffmpeg | `brew install ffmpeg` (required if using scrcpy) |
+```bash
+brew install android-platform-tools scrcpy ffmpeg
+```
 
-### Python packages
+On Linux:
+```bash
+sudo apt install adb scrcpy ffmpeg
+```
 
-See [requirements.md](requirements.md).
+### Python
+
+```bash
+pip install Pillow uiautomator2
+python -m uiautomator2 init   # one-time: installs agent APK on device
+```
+
+---
 
 ## Setup
 
 ```bash
 git clone https://github.com/your-username/keytap.git
 cd keytap
-pip install Pillow
-pip install uiautomator2   # optional, enables element mode
-python -m uiautomator2 init  # one-time device setup for element mode
+pip install Pillow uiautomator2
+python -m uiautomator2 init
 ```
 
-## Usage
-
+Connect your device:
 ```bash
-# connect device first
 adb devices
+```
 
-# basic
+Run:
+```bash
 python app.py
 
-# specify device
+# target a specific device
 python app.py --serial emulator-5554
-
-# custom grid
-python app.py --cols 12 --rows 28 --height 900
 ```
+
+---
 
 ## Keybindings
 
-### Navigation (cursor mode)
 | Key | Action |
 |---|---|
-| Arrow keys | Move cursor one cell |
+| Arrow keys | Move cursor |
 | Shift+Arrow | Jump 5 cells |
 | Space | Tap at cursor |
-
-### Device
-| Key | Action |
-|---|---|
+| `e` | Toggle element overlay |
 | `b` | Back |
 | `h` | Home |
 | `r` | Recent apps |
-| `w` | Scroll up |
-| `s` | Scroll down |
-
-### Modes
-| Key | Action |
-|---|---|
-| `e` | Toggle element overlay mode |
-| `Shift+Shift` | Open command palette |
+| `w` / `s` | Scroll up / down |
+| Shift+Shift | Open command palette |
 | Esc | Exit current mode |
 
-## Args
-
-| Flag | Default | Description |
-|---|---|---|
-| `--serial` | auto | ADB device serial |
-| `--cols` | 10 | Grid columns |
-| `--rows` | 32 | Grid rows |
-| `--height` | 800 | Mirror window height (px) |
+---
 
 ## License
 
