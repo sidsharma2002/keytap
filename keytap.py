@@ -75,6 +75,123 @@ def take_screencap():
     return result.stdout  # raw PNG bytes
 
 
+class CommandPalette:
+    """Spotlight-style package launcher. Trigger: double Shift."""
+    W, H   = 440, 380
+    BG     = "#1c1c1e"
+    BG_IN  = "#2c2c2e"
+    FG     = "#f0f0f0"
+    FG_DIM = "#888888"
+    ACCENT = "#00c864"
+    SEL_BG = "#3a3a3c"
+
+    def __init__(self, parent, packages, on_launch):
+        self._packages  = packages
+        self._filtered  = list(packages)
+        self._on_launch = on_launch
+
+        self.win = tk.Toplevel(parent)
+        self.win.title("keytap — launch app")
+        self.win.configure(bg=self.BG)
+        self.win.resizable(False, False)
+
+        # Center over parent
+        px, py = parent.winfo_x(), parent.winfo_y()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        x = px + (pw - self.W) // 2
+        y = py + (ph - self.H) // 2
+        self.win.geometry(f"{self.W}x{self.H}+{x}+{y}")
+
+        self._build()
+        self._filter("")
+        self.win.focus_force()
+        self._entry.focus_set()
+
+    def _build(self):
+        # Search row
+        row = tk.Frame(self.win, bg=self.BG_IN)
+        row.pack(fill="x", padx=12, pady=(12, 0))
+        tk.Label(row, text=">", bg=self.BG_IN, fg=self.FG_DIM,
+                 font=("Menlo", 13)).pack(side="left", padx=(8, 4))
+        self._var = tk.StringVar()
+        self._var.trace_add("write", lambda *_: self._filter(self._var.get()))
+        self._entry = tk.Entry(
+            row, textvariable=self._var,
+            bg=self.BG_IN, fg=self.FG, insertbackground=self.FG,
+            relief="flat", font=("Menlo", 13), bd=0
+        )
+        self._entry.pack(fill="x", padx=(0, 8), pady=8, expand=True)
+
+        # Divider
+        tk.Frame(self.win, bg="#3a3a3c", height=1).pack(fill="x")
+
+        # Results
+        self._listbox = tk.Listbox(
+            self.win, bg=self.BG, fg=self.FG,
+            selectbackground=self.SEL_BG, selectforeground=self.ACCENT,
+            relief="flat", bd=0, highlightthickness=0,
+            font=("Menlo", 12), activestyle="none", height=13
+        )
+        self._listbox.pack(fill="both", expand=True, padx=8, pady=4)
+
+        # Footer
+        self._footer = tk.StringVar()
+        tk.Label(self.win, textvariable=self._footer,
+                 bg=self.BG, fg=self.FG_DIM, font=("Menlo", 10),
+                 anchor="w", padx=14).pack(fill="x", pady=(0, 8))
+
+        # Bindings
+        for w in (self._entry, self._listbox):
+            w.bind("<Up>",     self._up)
+            w.bind("<Down>",   self._down)
+            w.bind("<Return>", self._launch)
+            w.bind("<Escape>", self._close)
+        self._listbox.bind("<Double-Button-1>", self._launch)
+        self.win.bind("<Escape>", self._close)
+
+    def _filter(self, query):
+        q = query.strip().lower()
+        self._filtered = [p for p in self._packages if q in p.lower()] if q else list(self._packages)
+        self._listbox.delete(0, tk.END)
+        for pkg in self._filtered[:60]:
+            self._listbox.insert(tk.END, f"  {pkg}")
+        if self._filtered:
+            self._listbox.selection_set(0)
+            self._footer.set(f"{len(self._filtered)} packages  |  Enter=launch  Esc=close")
+        else:
+            self._footer.set("no match")
+
+    def _up(self, _e):
+        cur = self._listbox.curselection()
+        if cur and cur[0] > 0:
+            self._listbox.selection_clear(0, tk.END)
+            self._listbox.selection_set(cur[0] - 1)
+            self._listbox.see(cur[0] - 1)
+        return "break"
+
+    def _down(self, _e):
+        cur = self._listbox.curselection()
+        nxt = (cur[0] + 1) if cur else 0
+        if nxt < self._listbox.size():
+            self._listbox.selection_clear(0, tk.END)
+            self._listbox.selection_set(nxt)
+            self._listbox.see(nxt)
+        return "break"
+
+    def _selected(self):
+        cur = self._listbox.curselection()
+        return self._filtered[cur[0]] if cur else None
+
+    def _launch(self, _e=None):
+        pkg = self._selected()
+        if pkg:
+            self._on_launch(pkg)
+            self._close()
+
+    def _close(self, _e=None):
+        self.win.destroy()
+
+
 class KeyTap:
     def __init__(self, dev_w, dev_h):
         self.dev_w = dev_w
@@ -91,6 +208,10 @@ class KeyTap:
         self._frame_q       = queue.Queue(maxsize=1)
         self._grid_font     = self._load_grid_font()
         self._last_scroll_t = 0.0
+        self._last_shift_t  = 0.0
+        self._packages      = []
+        self._packages_ready = False
+        self._palette       = None
 
         self._build_ui()
 
@@ -407,6 +528,16 @@ class KeyTap:
             self.root.destroy()
             return
 
+        # Double Shift → open command palette
+        if sym in ('Shift_L', 'Shift_R'):
+            now = time.time()
+            if now - self._last_shift_t < 0.4:
+                self._open_palette()
+                self._last_shift_t = 0.0
+            else:
+                self._last_shift_t = now
+            return
+
         if CURSOR_MODE:
             shift = bool(event.state & 0x1)
             step  = CURSOR_JUMP if shift else 1
@@ -481,9 +612,43 @@ class KeyTap:
             self.redraw()
             return
 
+    # ── Command palette ──────────────────────────────────────────────────────
+
+    def _fetch_packages(self):
+        result = adb("shell", "pm", "list", "packages")
+        pkgs = []
+        for line in result.stdout.decode().strip().splitlines():
+            line = line.strip()
+            if line.startswith("package:"):
+                pkgs.append(line[len("package:"):])
+        self._packages = sorted(pkgs)
+        self._packages_ready = True
+
+    def _open_palette(self):
+        if self._palette and self._palette.win.winfo_exists():
+            self._palette.win.lift()
+            self._palette.win.focus_force()
+            return
+        if not self._packages_ready:
+            self.status("package list still loading...")
+            return
+        self._palette = CommandPalette(
+            self.root, self._packages,
+            on_launch=self._launch_package
+        )
+
+    def _launch_package(self, pkg):
+        self.status(f"launching {pkg}")
+        threading.Thread(
+            target=lambda: adb("shell", "monkey", "-p", pkg,
+                               "-c", "android.intent.category.LAUNCHER", "1"),
+            daemon=True
+        ).start()
+
     # ── Run ──────────────────────────────────────────────────────────────────
 
     def run(self):
+        threading.Thread(target=self._fetch_packages, daemon=True).start()
         self._start_stream()
         self._display_loop()
         self.root.mainloop()
