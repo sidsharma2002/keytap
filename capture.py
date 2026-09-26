@@ -15,14 +15,15 @@ class CaptureManager:
     """Manages the video capture pipeline. Produces PIL frames into frame_q."""
 
     def __init__(self, win_w, win_h, on_status):
-        self.win_w      = win_w
-        self.win_h      = win_h
-        self._on_status = on_status   # callable(msg: str) - must be thread-safe
-        self.frame_q    = queue.Queue(maxsize=1)
+        self.win_w        = win_w
+        self.win_h        = win_h
+        self._on_status   = on_status   # callable(msg: str) - must be thread-safe
+        self.frame_q      = queue.Queue(maxsize=1)
+        self._scrcpy_live = threading.Event()  # set when scrcpy stream produces first frame
 
     def start(self):
         if HAS_SCRCPY and HAS_FFMPEG:
-            threading.Thread(target=self._initial_screencap, daemon=True).start()
+            threading.Thread(target=self._screencap_until_live, daemon=True).start()
             threading.Thread(target=self._scrcpy_stream, daemon=True).start()
         else:
             missing = [x for x, ok in [("scrcpy", HAS_SCRCPY), ("ffmpeg", HAS_FFMPEG)] if not ok]
@@ -40,13 +41,16 @@ class CaptureManager:
         img = Image.open(io.BytesIO(png))
         return img.resize((self.win_w, self.win_h), Image.BILINEAR)
 
-    def _initial_screencap(self):
-        try:
-            png = take_screencap()
-            if png and len(png) > 512:
-                self._enqueue(self._png_to_frame(png))
-        except Exception:
-            pass
+    def _screencap_until_live(self):
+        """Poll screencap every 2s while scrcpy is connecting, stop once stream is live."""
+        while not self._scrcpy_live.is_set():
+            try:
+                png = take_screencap()
+                if png and len(png) > 512:
+                    self._enqueue(self._png_to_frame(png))
+            except Exception:
+                pass
+            self._scrcpy_live.wait(timeout=2.0)
 
     def _scrcpy_stream(self):
         try:
@@ -60,16 +64,20 @@ class CaptureManager:
         if ARGS.serial:
             scrcpy_cmd += [f"--serial={ARGS.serial}"]
 
+        # NOTE: -fflags nobuffer breaks the matroska demuxer (0 frames produced).
+        # Root cause: nobuffer prevents the MKV Tracks element from being buffered,
+        # so the demuxer never finds a decodable video stream.
+        # -analyzeduration 0 also breaks FIFO input: ffmpeg does a non-blocking open,
+        # gets nothing before scrcpy connects (~8s), and immediately exits with 0 frames.
         ffmpeg_cmd = [
             "ffmpeg",
-            "-fflags", "nobuffer", "-flags", "low_delay",
-            "-probesize", "32", "-analyzeduration", "0",
+            "-flags", "low_delay",
             "-f", "matroska", "-i", FIFO_PATH,
             "-vf", f"scale={self.win_w}:{self.win_h}",
             "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
         ]
 
-        t_start    = time.time()
+        t_start     = time.time()
         scrcpy_proc = subprocess.Popen(scrcpy_cmd, stderr=subprocess.DEVNULL)
         ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         self._on_status("connecting scrcpy...")
@@ -89,6 +97,7 @@ class CaptureManager:
                 elapsed = time.time() - t_start
                 print(f"[keytap] first scrcpy frame in {elapsed:.2f}s", flush=True)
                 self._on_status(f"streaming  |  first frame in {elapsed:.2f}s")
+                self._scrcpy_live.set()  # stop screencap polling
                 first_frame = False
             self._enqueue(Image.frombytes("RGB", (self.win_w, self.win_h), data))
 
