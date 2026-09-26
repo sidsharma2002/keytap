@@ -221,7 +221,12 @@ class KeyTap:
             scrcpy_cmd += [f"--serial={ARGS.serial}"]
 
         ffmpeg_cmd = [
-            "ffmpeg", "-f", "matroska", "-i", FIFO_PATH,
+            "ffmpeg",
+            "-fflags", "nobuffer",
+            "-flags", "low_delay",
+            "-probesize", "32",
+            "-analyzeduration", "0",
+            "-f", "matroska", "-i", FIFO_PATH,
             "-vf", f"scale={self.win_w}:{self.win_h}",
             "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"
         ]
