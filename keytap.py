@@ -42,8 +42,8 @@ HAS_FFMPEG = shutil.which("ffmpeg") is not None
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--serial", default=None, help="ADB serial (e.g. emulator-5554)")
-    p.add_argument("--cols",   type=int, default=7)
-    p.add_argument("--rows",   type=int, default=14)
+    p.add_argument("--cols",   type=int, default=10)
+    p.add_argument("--rows",   type=int, default=20)
     p.add_argument("--height", type=int, default=800, help="mirror window height px")
     return p.parse_args()
 
@@ -119,8 +119,8 @@ class KeyTap:
     # ── Coordinate helpers ────────────────────────────────────────────────────
 
     def cell_to_dev(self, label):
-        r = string.ascii_uppercase.index(label[0])
-        c = int(label[1]) - 1
+        r = string.ascii_uppercase.index(label[0].upper())
+        c = string.ascii_uppercase.index(label[1].upper())
         if r >= ARGS.rows or c >= ARGS.cols:
             raise ValueError("out of range")
         cw = self.dev_w / ARGS.cols
@@ -161,11 +161,11 @@ class KeyTap:
                 x0, y0 = int(c * cw), int(r * ch)
                 x1, y1 = int((c + 1) * cw), int((r + 1) * ch)
                 cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
-                label = f"{string.ascii_uppercase[r]}{c + 1}"
+                label = f"{string.ascii_uppercase[r]}{string.ascii_uppercase[c]}"
                 active = bool(typed and label.startswith(typed))
 
                 line_rgba  = (255, 215, 0, ALPHA) if active else (255, 255, 255, ALPHA)
-                label_rgba = (255, 215, 0, 230)   if active else (180, 180, 180, ALPHA)
+                label_rgba = (0, 255, 100, 230)    if active else (0, 210, 80, ALPHA)
 
                 draw.rectangle([x0, y0, x1 - 1, y1 - 1], outline=line_rgba)
                 draw.text((cx + 1, cy + 1), label, fill=(0, 0, 0, ALPHA),
@@ -186,6 +186,8 @@ class KeyTap:
     def _start_stream(self):
         """Start scrcpy + ffmpeg pipeline. Falls back to screencap if unavailable."""
         if HAS_SCRCPY and HAS_FFMPEG:
+            # Show one screencap immediately while scrcpy connects
+            threading.Thread(target=self._initial_screencap, daemon=True).start()
             threading.Thread(target=self._scrcpy_stream, daemon=True).start()
         else:
             missing = []
@@ -194,9 +196,23 @@ class KeyTap:
             self.root.after(0, lambda: self.status(f"missing {','.join(missing)} - using screencap"))
             threading.Thread(target=self._screencap_loop, daemon=True).start()
 
+    def _initial_screencap(self):
+        """Take one screencap immediately so window isn't blank while scrcpy connects."""
+        try:
+            png = take_screencap()
+            if png and len(png) > 512:
+                img = Image.open(io.BytesIO(png))
+                img = img.resize((self.win_w, self.win_h), Image.BILINEAR)
+                try:
+                    self._frame_q.get_nowait()
+                except queue.Empty:
+                    pass
+                self._frame_q.put(img)
+        except Exception:
+            pass
+
     def _scrcpy_stream(self):
         """scrcpy → FIFO → ffmpeg → raw RGB24 frames."""
-        # Setup FIFO
         try:
             os.unlink(FIFO_PATH)
         except FileNotFoundError:
@@ -222,16 +238,18 @@ class KeyTap:
             "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"
         ]
 
+        t_start = time.time()
+        # Start both concurrently - FIFO open() blocks until both ends are open,
+        # no sleep needed; OS synchronizes reader/writer handshake.
         scrcpy_proc = subprocess.Popen(scrcpy_cmd, stderr=subprocess.DEVNULL)
-        # Small delay so scrcpy connects before ffmpeg opens FIFO
-        time.sleep(1.5)
         ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
         self._scrcpy_proc = scrcpy_proc
         self._ffmpeg_proc = ffmpeg_proc
-        self.root.after(0, lambda: self.status("streaming via scrcpy..."))
+        self.root.after(0, lambda: self.status("connecting scrcpy..."))
 
         frame_size = self.win_w * self.win_h * 3
+        first_frame = True
         while True:
             data = ffmpeg_proc.stdout.read(frame_size)
             if len(data) != frame_size:
@@ -241,6 +259,11 @@ class KeyTap:
                 time.sleep(1)
                 threading.Thread(target=self._scrcpy_stream, daemon=True).start()
                 return
+            if first_frame:
+                elapsed = time.time() - t_start
+                print(f"[keytap] first scrcpy frame in {elapsed:.2f}s", flush=True)
+                self.root.after(0, lambda e=elapsed: self.status(f"streaming  |  first frame in {e:.2f}s"))
+                first_frame = False
             img = Image.frombytes("RGB", (self.win_w, self.win_h), data)
             try:
                 self._frame_q.get_nowait()
@@ -303,7 +326,7 @@ class KeyTap:
         if buf:
             self.status(f"typing: {buf}_  (Backspace=clear)")
         else:
-            self.status("type cell label to tap (e.g. A1, B3)  |  Esc=quit")
+            self.status("type 2-letter label to tap (e.g. AA, BJ, TC)  |  Esc=quit")
 
     # ── Key handler ──────────────────────────────────────────────────────────
 
@@ -328,7 +351,7 @@ class KeyTap:
             self._idle_status()
             return
 
-        if char.isdigit() and len(self.input_buf) == 1:
+        if char.isalpha() and len(self.input_buf) == 1:
             self.input_buf.append(char)
             label = ''.join(self.input_buf)
             self.input_buf.clear()
