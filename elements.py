@@ -66,3 +66,73 @@ def dump_elements(serial=None):
         })
 
     return elements
+
+
+# ── Hierarchy tree dump ───────────────────────────────────────────────────────
+
+def _node_to_dict(el):
+    cls = el.get('class', '')
+    short_cls = cls.rsplit('.', 1)[-1] if '.' in cls else cls
+
+    rid = el.get('resource-id', '')
+    if ':id/' in rid:
+        rid = rid.split(':id/', 1)[1]
+
+    bounds = _parse_bounds(el.get('bounds', ''))
+    cx = cy = 0
+    if bounds:
+        x1, y1, x2, y2 = bounds
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+
+    return {
+        'class_name':   short_cls,
+        'text':         el.get('text', '').strip(),
+        'resource_id':  rid,
+        'content_desc': el.get('content-desc', '').strip(),
+        'bounds':       bounds,
+        'cx': cx, 'cy': cy,
+        'clickable':    el.get('clickable') == 'true',
+        'children':     [_node_to_dict(child) for child in el],
+    }
+
+
+def _collect_flat(node, out):
+    out.append(node)
+    for child in node['children']:
+        _collect_flat(child, out)
+
+
+def dump_hierarchy_tree(serial=None):
+    """Return (root_dict, flat_node_list). Uses u2 if available, else uiautomator dump."""
+    if HAS_U2:
+        d = u2.connect(serial) if serial else u2.connect()
+        xml_raw = d.dump_hierarchy()
+        xml_str = xml_raw if isinstance(xml_raw, str) else xml_raw.decode()
+    else:
+        import subprocess
+        cmd = ['adb']
+        if serial:
+            cmd += ['-s', serial]
+        cmd += ['shell', 'uiautomator', 'dump', '/dev/stdout']
+        result = subprocess.run(cmd, capture_output=True, timeout=15)
+        xml_str = result.stdout.decode(errors='replace').strip()
+
+    root_el = ET.fromstring(xml_str)
+    if root_el.tag == 'hierarchy':
+        children = list(root_el)
+        if len(children) == 1:
+            root_node = _node_to_dict(children[0])
+        else:
+            root_node = {
+                'class_name': 'root', 'text': '', 'resource_id': '',
+                'content_desc': '', 'bounds': None, 'cx': 0, 'cy': 0,
+                'clickable': False,
+                'children': [_node_to_dict(c) for c in children],
+            }
+    else:
+        root_node = _node_to_dict(root_el)
+
+    flat = []
+    _collect_flat(root_node, flat)
+    return root_node, flat

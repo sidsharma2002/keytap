@@ -45,6 +45,7 @@ class KeyTap:
         self._elem_ref_frame   = None
         self._elem_last_dump_t = 0.0
         self._elem_show_bounds = False
+        self._hier_highlight   = None   # (wx1, wy1, wx2, wy2) or None
 
         self._build_ui()
 
@@ -119,7 +120,8 @@ class KeyTap:
                     'show_bounds': self._elem_show_bounds,
                 })
         composited = self._renderer.composite(
-            frame, self.cursor_row, self.cursor_col, self.input_buf, win_elements
+            frame, self.cursor_row, self.cursor_col, self.input_buf, win_elements,
+            highlight_bounds=self._hier_highlight
         )
         self.photo = ImageTk.PhotoImage(composited)
         self.canvas.itemconfig(self._img_id, image=self.photo)
@@ -436,6 +438,18 @@ class KeyTap:
         )
 
     def _on_palette_action(self, pkg, action):
+        if pkg == "__view-hierarchy__":
+            threading.Thread(target=self._fetch_hierarchy, daemon=True).start()
+            return
+        if pkg == "__tap-hierarchy__":
+            cx, cy = action.split(",")
+            self._run_adb("shell", "input", "tap", cx, cy)
+            self.status(f"tapped ({cx},{cy})")
+            return
+        if pkg == "__refresh-hierarchy__":
+            self.status("refreshing hierarchy...")
+            threading.Thread(target=self._fetch_hierarchy, daemon=True).start()
+            return
         if pkg == "__input-text__":
             text = action
             if not text:
@@ -630,6 +644,28 @@ class KeyTap:
             "osascript", "-e",
             f'tell application "Terminal" to do script "nano {tmppath}"'
         ])
+
+    def _fetch_hierarchy(self):
+        try:
+            from elements import dump_hierarchy_tree
+            root_node, flat_nodes = dump_hierarchy_tree(ARGS.serial)
+            self.root.after(0, lambda: self._on_hierarchy_loaded(root_node, flat_nodes))
+        except Exception as e:
+            self.root.after(0, lambda: self.status(f"hierarchy error: {e}"))
+
+    def _on_hier_hover(self, bounds):
+        if bounds:
+            s = self.scale
+            x1, y1, x2, y2 = bounds
+            self._hier_highlight = (int(x1 * s), int(y1 * s), int(x2 * s), int(y2 * s))
+        else:
+            self._hier_highlight = None
+        self.redraw()
+
+    def _on_hierarchy_loaded(self, root_node, flat_nodes):
+        self.status(f"hierarchy: {len(flat_nodes)} nodes")
+        if self._palette and self._palette.win.winfo_exists():
+            self._palette.show_hierarchy(root_node, flat_nodes, on_hover=self._on_hier_hover)
 
     def _on_viewer_loaded(self, title, items, on_select=None):
         self.status(f"{title}: {len(items)} keys")

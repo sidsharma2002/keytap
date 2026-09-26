@@ -86,13 +86,17 @@ class CommandPalette:
             w.bind("<Return>", self._select)
             w.bind("<Escape>", self._on_esc)
         self._listbox.bind("<Double-Button-1>", self._select)
+        self._listbox.bind("<<ListboxSelect>>", self._on_listbox_select)
         self.win.bind("<Escape>", self._on_esc)
+        self.win.bind("<Command-r>", self._on_ctrl_r)
 
     def _on_query_change(self):
         if self._state == "viewer":
             self._filter_viewer(self._var.get())
         elif self._state == "input":
             pass  # free-text entry, no filtering
+        elif self._state == "hierarchy":
+            self._filter_hierarchy(self._var.get())
         else:
             self._filter(self._var.get())
 
@@ -107,6 +111,8 @@ class CommandPalette:
             self._virtual.append((f"  Launch: {q}", "deeplink", q))
             self._pkg_filtered = []
         else:
+            if not ql or ql in "view hierarchy":
+                self._virtual.append(("  View Hierarchy — browse UI tree", "view-hierarchy", ""))
             if not ql or ql in "input text":
                 self._virtual.append(("  Input Text — type to send to device", "input-text", ""))
             if ql and ql in "clipboard":
@@ -140,6 +146,7 @@ class CommandPalette:
             self._listbox.selection_clear(0, tk.END)
             self._listbox.selection_set(cur[0] - 1)
             self._listbox.see(cur[0] - 1)
+            self._on_listbox_select()
         return "break"
 
     def _down(self, _e):
@@ -149,6 +156,7 @@ class CommandPalette:
             self._listbox.selection_clear(0, tk.END)
             self._listbox.selection_set(nxt)
             self._listbox.see(nxt)
+            self._on_listbox_select()
         return "break"
 
     def _select(self, _e=None):
@@ -157,6 +165,23 @@ class CommandPalette:
             if text:
                 self._on_action("__input-text__", text)
                 self._close()
+            return "break"
+        if self._state == "hierarchy":
+            cur = self._listbox.curselection()
+            if not cur:
+                return "break"
+            node = self._hier_shown[cur[0]]
+            if node['children']:
+                self._hier_nav_stack.append((self._hier_current_nodes, self._hier_current_label))
+                label = (node['resource_id'] or
+                         (f'"{node["text"][:20]}"' if node['text'] else node['class_name']))
+                self._hier_current_nodes = node['children']
+                self._hier_current_label = label
+                self._var.set("")
+                self._hier_show_level()
+            else:
+                if node['cx'] or node['cy']:
+                    self._on_action("__tap-hierarchy__", f"{node['cx']},{node['cy']}")
             return "break"
         if self._state == "viewer":
             if self._viewer_on_select:
@@ -174,6 +199,9 @@ class CommandPalette:
                 _, vtype, vvalue = self._virtual[idx]
                 if vtype == "input-text":
                     self._show_input_mode()
+                elif vtype == "view-hierarchy":
+                    self._enter_hierarchy_loading()
+                    self._on_action("__view-hierarchy__", "")
                 else:
                     self._on_action(f"__{vtype}__", vvalue)
                     self._close()
@@ -277,9 +305,34 @@ class CommandPalette:
         self._entry.focus_set()
         self._footer.set("Type text  |  Enter=send to device  Esc=back")
 
+    def _on_listbox_select(self, _e=None):
+        if self._state == "hierarchy" and getattr(self, '_hier_on_hover', None):
+            cur = self._listbox.curselection()
+            if cur and cur[0] < len(self._hier_shown):
+                self._hier_on_hover(self._hier_shown[cur[0]].get('bounds'))
+            else:
+                self._hier_on_hover(None)
+
+    def _on_ctrl_r(self, _e=None):
+        if self._state == "hierarchy":
+            self._on_action("__refresh-hierarchy__", "")
+        return "break"
+
     def _on_esc(self, _e=None):
         if self._state == "input":
             self._back_to_search()
+        elif self._state == "hierarchy":
+            if self._var.get():
+                self._var.set("")
+                self._hier_show_level()
+            elif self._hier_nav_stack:
+                self._hier_current_nodes, self._hier_current_label = self._hier_nav_stack.pop()
+                self._hier_show_level()
+            else:
+                self._hier_clear_hover()
+                self.win.resizable(False, False)
+                self.win.geometry(f"{self.W}x{self.H}")
+                self._back_to_search()
         elif self._state == "viewer":
             self._back_to_actions()
         elif self._state == "actions":
@@ -288,5 +341,93 @@ class CommandPalette:
             self._close()
         return "break"
 
+    def _hier_clear_hover(self):
+        if getattr(self, '_hier_on_hover', None):
+            self._hier_on_hover(None)
+
+    def _enter_hierarchy_loading(self):
+        self._state = "hierarchy"
+        self._hier_nav_stack = []
+        self._hier_current_nodes = []
+        self._hier_current_label = "root"
+        self._hier_all_flat = []
+        self._hier_shown = []
+        self._entry.config(state="disabled")
+        self._listbox.delete(0, tk.END)
+        self._listbox.insert(tk.END, "  loading hierarchy...")
+        self._footer.set("fetching UI hierarchy from device...")
+
+    def show_hierarchy(self, root_node, flat_nodes, on_hover=None):
+        """Called from app after hierarchy is fetched."""
+        self._hier_nav_stack = []
+        self._hier_all_flat = flat_nodes
+        self._hier_current_nodes = root_node['children'] or [root_node]
+        self._hier_current_label = "root"
+        self._hier_on_hover = on_hover
+        self._state = "hierarchy"
+        self._entry.config(state="normal")
+        self._var.set("")
+        self.win.resizable(True, True)
+        self.win.geometry(f"750x{self.H}")
+        self._hier_show_level()
+        self._entry.focus_set()
+
+    def _hier_show_level(self):
+        self._hier_shown = list(self._hier_current_nodes)
+        self._listbox.delete(0, tk.END)
+        for n in self._hier_shown:
+            self._listbox.insert(tk.END, self._hier_node_label(n))
+        if self._hier_shown:
+            self._listbox.selection_set(0)
+            if getattr(self, '_hier_on_hover', None):
+                self._hier_on_hover(self._hier_shown[0].get('bounds'))
+        self._hier_update_footer()
+
+    def _hier_node_label(self, node):
+        cls = node['class_name'] or '?'
+        text = f' "{node["text"][:28]}"' if node['text'] else ''
+        rid = f' [{node["resource_id"]}]' if node['resource_id'] else ''
+        n_ch = len(node['children'])
+        if n_ch:
+            hint = f' ({n_ch})'
+        elif node['clickable']:
+            hint = ' ·tap'
+        else:
+            hint = ''
+        return f"  {cls}{text}{rid}{hint}"
+
+    def _filter_hierarchy(self, query):
+        ql = query.strip().lower()
+        if not ql:
+            self._hier_shown = list(self._hier_current_nodes)
+        else:
+            self._hier_shown = [
+                n for n in self._hier_all_flat
+                if ql in n['text'].lower()
+                or ql in n['resource_id'].lower()
+                or ql in n['class_name'].lower()
+                or ql in n['content_desc'].lower()
+            ]
+        self._listbox.delete(0, tk.END)
+        for n in self._hier_shown:
+            self._listbox.insert(tk.END, self._hier_node_label(n))
+        if self._hier_shown:
+            self._listbox.selection_set(0)
+            if getattr(self, '_hier_on_hover', None):
+                self._hier_on_hover(self._hier_shown[0].get('bounds'))
+        elif getattr(self, '_hier_on_hover', None):
+            self._hier_on_hover(None)
+        self._hier_update_footer(searching=bool(ql))
+
+    def _hier_update_footer(self, searching=False):
+        path_parts = [lbl for _, lbl in self._hier_nav_stack] + [self._hier_current_label]
+        path = " > ".join(path_parts[-4:])
+        n = len(self._hier_shown)
+        scope = " (all)" if searching else ""
+        self._footer.set(
+            f"{path}  |  {n} nodes{scope}  Enter=expand/tap  Cmd+R=refresh  Esc=up"
+        )
+
     def _close(self, _e=None):
+        self._hier_clear_hover()
         self.win.destroy()

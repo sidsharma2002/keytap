@@ -37,7 +37,7 @@ class GridRenderer:
                 pass
         return ImageFont.load_default()
 
-    def composite(self, frame, cursor_row, cursor_col, input_buf, elements=None):
+    def composite(self, frame, cursor_row, cursor_col, input_buf, elements=None, highlight_bounds=None):
         base = frame.convert("RGBA")
         overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
@@ -79,6 +79,11 @@ class GridRenderer:
 
         if elements:
             self._draw_elements(draw, elements)
+
+        if highlight_bounds:
+            x1, y1, x2, y2 = highlight_bounds
+            draw.rectangle([x1, y1, x2, y2], fill=(255, 200, 0, 25))
+            draw.rectangle([x1, y1, x2, y2], outline=(255, 200, 0, 230), width=2)
 
         return Image.alpha_composite(base, overlay).convert("RGB")
 
