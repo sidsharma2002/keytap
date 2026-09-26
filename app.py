@@ -1,11 +1,8 @@
 import sys
 import os
 import json
-import sqlite3 as sqlite
 import string
 import subprocess
-import tempfile
-import xml.etree.ElementTree as ET
 import tkinter as tk
 from PIL import ImageTk, ImageChops
 import threading
@@ -17,6 +14,8 @@ from capture import CaptureManager
 from grid import GridRenderer
 from palette import CommandPalette
 from elements import LABEL_CHARS
+from inspectors import shared_prefs, remote_config, litmus, permissions
+from inspectors.hierarchy import dump_hierarchy_tree
 
 
 class KeyTap:
@@ -500,76 +499,24 @@ class KeyTap:
             self.status(f"reading permissions {pkg}...")
             threading.Thread(target=lambda p=pkg: self._fetch_permissions(p), daemon=True).start()
 
-    # ── Shared Prefs / Remote Config viewer ──────────────────────────────────
-
-    def _list_prefs_files(self, pkg):
-        result = adb("shell", "run-as", pkg, "ls", f"/data/data/{pkg}/shared_prefs/")
-        return [f.strip() for f in result.stdout.decode().splitlines()
-                if f.strip().endswith(".xml")]
-
-    def _read_prefs_file(self, pkg, fname):
-        return adb("shell", "run-as", pkg, "cat",
-                   f"/data/data/{pkg}/shared_prefs/{fname}").stdout.decode()
-
-    def _parse_prefs_xml(self, xml_str):
-        items = []
-        try:
-            root = ET.fromstring(xml_str)
-            for child in root:
-                key = child.get("name", "?")
-                if child.tag == "string":
-                    val = child.text or ""
-                elif child.tag in ("boolean", "int", "long", "float"):
-                    val = child.get("value", "?")
-                elif child.tag == "set":
-                    val = "{" + ", ".join(i.text or "" for i in child) + "}"
-                else:
-                    val = f"<{child.tag}>"
-                items.append((key, val))
-        except Exception as e:
-            items.append(("parse error", str(e)))
-        return items
+    # ── Inspector fetchers (delegate to inspectors package) ───────────────────
 
     def _fetch_shared_prefs(self, pkg):
-        items = []
-        try:
-            for fname in self._list_prefs_files(pkg):
-                xml = self._read_prefs_file(pkg, fname)
-                for k, v in self._parse_prefs_xml(xml):
-                    items.append((k, v))
-        except Exception as e:
-            items = [("error", str(e))]
+        items = shared_prefs.fetch(pkg)
         self.root.after(0, lambda: self._on_viewer_loaded("Shared Prefs", items))
 
     def _fetch_remote_config(self, pkg):
-        items = []
-        try:
-            rc_keywords = ("config", "remote", "firebase")
-            files = [f for f in self._list_prefs_files(pkg)
-                     if any(kw in f.lower() for kw in rc_keywords)]
-            for fname in files:
-                xml = self._read_prefs_file(pkg, fname)
-                for k, v in self._parse_prefs_xml(xml):
-                    items.append((k, v))
-            if not items:
-                items = [("(no remote config files found)", "try Shared Prefs for full list")]
-        except Exception as e:
-            items = [("error", str(e))]
+        items = remote_config.fetch(pkg)
         self.root.after(0, lambda: self._on_viewer_loaded("Remote Config", items))
 
-    def _fetch_permissions(self, pkg, _refresh=False):
-        items = []
-        try:
-            out = adb("shell", "dumpsys", "package", pkg).stdout.decode()
-            for line in out.splitlines():
-                s = line.strip()
-                if ": granted=" in s:
-                    perm, rest = s.split(": granted=", 1)
-                    granted = rest.split(",")[0].strip() == "true"
-                    items.append((perm.strip(), "GRANTED" if granted else "DENIED"))
-        except Exception as e:
-            items = [("error", str(e))]
+    def _fetch_litmus(self, pkg):
+        items, raw_by_name = litmus.fetch(pkg)
+        def on_select(key, _display):
+            litmus.open_nano(key, raw_by_name.get(key, "{}"))
+        self.root.after(0, lambda: self._on_viewer_loaded("Litmus", items, on_select=on_select))
 
+    def _fetch_permissions(self, pkg, _refresh=False):
+        items = permissions.fetch(pkg)
         def on_select(perm, state):
             if state.startswith("GRANTED"):
                 self._run_adb("shell", "pm", "revoke", pkg, perm)
@@ -577,10 +524,7 @@ class KeyTap:
             else:
                 self._run_adb("shell", "pm", "grant", pkg, perm)
                 self.status(f"granted {perm}")
-            threading.Timer(
-                0.6, lambda p=pkg: self._refresh_permissions(p)
-            ).start()
-
+            threading.Timer(0.6, lambda p=pkg: self._refresh_permissions(p)).start()
         if _refresh:
             self.root.after(0, lambda i=items: self._on_permissions_refresh(i))
         else:
@@ -593,62 +537,8 @@ class KeyTap:
         if self._palette and self._palette.win.winfo_exists():
             self._palette.update_viewer_items(items)
 
-    def _fetch_litmus(self, pkg):
-        items = []
-        raw_by_name = {}
-        try:
-            result = adb("shell", "run-as", pkg, "cat",
-                         f"/data/data/{pkg}/databases/cp-litmus.db")
-            if result.returncode != 0 or len(result.stdout) < 100:
-                items = [("error", "cp-litmus.db not found or unreadable")]
-            else:
-                with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-                    f.write(result.stdout)
-                    tmppath = f.name
-                try:
-                    conn = sqlite.connect(tmppath)
-                    rows = conn.execute(
-                        "SELECT experiment_name, experiment_value FROM experiment"
-                    ).fetchall()
-                    conn.close()
-                    for name, value_json in rows:
-                        raw_by_name[name] = value_json
-                        try:
-                            v = json.loads(value_json)
-                            variant = v.get("variant", "?")
-                            props = v.get("properties", {})
-                            props_str = "  |  " + ", ".join(
-                                f"{k}: {val}" for k, val in props.items()
-                            ) if props else ""
-                            items.append((name, f"{variant}{props_str}"))
-                        except Exception:
-                            items.append((name, value_json[:120]))
-                finally:
-                    os.unlink(tmppath)
-        except Exception as e:
-            items = [("error", str(e))]
-
-        def on_select(key, _display):
-            self._open_nano(key, raw_by_name.get(key, "{}"))
-
-        self.root.after(0, lambda: self._on_viewer_loaded("Litmus", items, on_select=on_select))
-
-    def _open_nano(self, key, raw_json):
-        try:
-            pretty = json.dumps(json.loads(raw_json), indent=2)
-        except Exception:
-            pretty = raw_json
-        tmppath = "/tmp/keytap_litmus_detail.json"
-        with open(tmppath, "w") as f:
-            f.write(pretty)
-        subprocess.Popen([
-            "osascript", "-e",
-            f'tell application "Terminal" to do script "nano {tmppath}"'
-        ])
-
     def _fetch_hierarchy(self):
         try:
-            from elements import dump_hierarchy_tree
             root_node, flat_nodes = dump_hierarchy_tree(ARGS.serial)
             self.root.after(0, lambda: self._on_hierarchy_loaded(root_node, flat_nodes))
         except Exception as e:
