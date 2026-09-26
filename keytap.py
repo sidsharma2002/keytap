@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
 """
-keytap - Android mirror with keyboard control
-Screencap-based mirror + Vimium-style grid hints + arrow cursor.
+keytap - Android mirror with always-on grid overlay
 
 Controls:
-  f            hint mode (grid labels appear instantly)
-  A1..J4       tap that cell
-  Esc          cancel hint / quit
-  arrows       move cursor (Shift=fast, Option=fine)
-  Space        tap at cursor
-  s + arrow    swipe direction
-  r            refresh screencap
+  A1..J8       tap that cell (type row letter then column number)
+  Backspace    clear input buffer
+  Esc          quit
 
 Usage:
   python3 keytap.py
@@ -33,12 +28,14 @@ import os
 import shutil
 
 try:
-    from PIL import Image, ImageTk
+    from PIL import Image, ImageTk, ImageDraw, ImageFont
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
 
 ADB_PATH   = "/Users/sidharthsharma/Library/Android/sdk/platform-tools/adb"
+CURSOR_MODE = True   # True = arrow-key cursor; False = 2-letter label typing
+CURSOR_JUMP = 5      # Shift+arrow jumps this many cells at once
 FIFO_PATH  = "/tmp/keytap_stream.fifo"
 HAS_SCRCPY = shutil.which("scrcpy") is not None
 HAS_FFMPEG = shutil.which("ffmpeg") is not None
@@ -47,8 +44,8 @@ HAS_FFMPEG = shutil.which("ffmpeg") is not None
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--serial", default=None, help="ADB serial (e.g. emulator-5554)")
-    p.add_argument("--cols",   type=int, default=4)
-    p.add_argument("--rows",   type=int, default=8)
+    p.add_argument("--cols",   type=int, default=10)
+    p.add_argument("--rows",   type=int, default=32)
     p.add_argument("--height", type=int, default=800, help="mirror window height px")
     return p.parse_args()
 
@@ -79,12 +76,6 @@ def take_screencap():
 
 
 class KeyTap:
-    STEP_NORMAL = 50
-    STEP_FAST   = 200
-    STEP_FINE   = 10
-    SWIPE_DIST  = 700
-    SWIPE_MS    = 300
-
     def __init__(self, dev_w, dev_h):
         self.dev_w = dev_w
         self.dev_h = dev_h
@@ -92,14 +83,14 @@ class KeyTap:
         self.win_w  = int(dev_w * self.scale)
         self.win_h  = ARGS.height
 
-        self.cursor_x = dev_w // 2
-        self.cursor_y = dev_h // 2
-
-        self.hint_mode  = False
-        self.hint_buf   = []
-        self.swipe_mode = False
-        self.photo      = None
-        self._frame_q   = queue.Queue(maxsize=1)
+        self.input_buf      = []
+        self.cursor_row     = 0
+        self.cursor_col     = 0
+        self.photo          = None
+        self._raw_frame     = None
+        self._frame_q       = queue.Queue(maxsize=1)
+        self._grid_font     = self._load_grid_font()
+        self._last_scroll_t = 0.0
 
         self._build_ui()
 
@@ -132,69 +123,117 @@ class KeyTap:
 
     # ── Coordinate helpers ────────────────────────────────────────────────────
 
-    def to_win(self, dx, dy):
-        return int(dx * self.scale), int(dy * self.scale)
-
     def cell_to_dev(self, label):
-        r = string.ascii_uppercase.index(label[0])
-        c = int(label[1]) - 1
+        r = string.ascii_uppercase.index(label[0].upper())
+        c = string.ascii_uppercase.index(label[1].upper())
         if r >= ARGS.rows or c >= ARGS.cols:
             raise ValueError("out of range")
+        return self.cell_to_dev_rc(r, c)
+
+    def cell_to_dev_rc(self, r, c):
         cw = self.dev_w / ARGS.cols
         ch = self.dev_h / ARGS.rows
         return int(c * cw + cw / 2), int(r * ch + ch / 2)
 
     # ── Drawing ───────────────────────────────────────────────────────────────
 
-    def redraw(self):
-        self.canvas.itemconfig(self._img_id, image=self.photo or "")
-        self.canvas.delete("overlay")
-        if self.hint_mode:
-            self._draw_hints()
-        self._draw_cursor()
+    def _load_grid_font(self):
+        if not HAS_PIL:
+            return None
+        fs = max(8, int(min(self.win_w / ARGS.cols, self.win_h / ARGS.rows) // 5))
+        for path in [
+            "/System/Library/Fonts/Menlo.ttc",
+            "/System/Library/Fonts/Monaco.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        ]:
+            try:
+                return ImageFont.truetype(path, fs)
+            except Exception:
+                pass
+        return ImageFont.load_default()
 
-    def _draw_cursor(self):
-        cx, cy = self.to_win(self.cursor_x, self.cursor_y)
-        color = "#FF4444" if self.hint_mode else "#00FF88"
-        arm = 14
-        t = "overlay"
-        self.canvas.create_line(cx - arm, cy, cx + arm, cy, fill="black", width=3, tags=t)
-        self.canvas.create_line(cx, cy - arm, cx, cy + arm, fill="black", width=3, tags=t)
-        self.canvas.create_line(cx - arm, cy, cx + arm, cy, fill=color,   width=1, tags=t)
-        self.canvas.create_line(cx, cy - arm, cx, cy + arm, fill=color,   width=1, tags=t)
-        self.canvas.create_oval(cx-3, cy-3, cx+3, cy+3, fill=color, outline="", tags=t)
+    def _composite_grid(self, frame):
+        """Progressive-reveal grid overlay composited onto a PIL Image."""
+        base = frame.convert("RGBA")
+        overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
 
-    def _draw_hints(self):
-        cw = self.win_w / ARGS.cols
-        ch = self.win_h / ARGS.rows
-        fs = max(9, int(min(cw, ch) // 4))
-        typed = ''.join(self.hint_buf).upper()
+        W, H = base.size
+        cw = W / ARGS.cols
+        ch = H / ARGS.rows
+        typed = ''.join(self.input_buf).upper()
+        row_selected = len(typed) == 1
 
         for r in range(ARGS.rows):
+            row_letter = string.ascii_uppercase[r] if r < 26 else None
+            row_match = row_selected and row_letter and row_letter == typed[0]
+
             for c in range(ARGS.cols):
-                x0, y0 = c * cw, r * ch
-                x1, y1 = x0 + cw, y0 + ch
-                cx, cy = x0 + cw / 2, y0 + ch / 2
-                label = f"{string.ascii_uppercase[r]}{c + 1}"
+                x0, y0 = int(c * cw), int(r * ch)
+                x1, y1 = int((c + 1) * cw), int((r + 1) * ch)
+                is_cursor = CURSOR_MODE and r == self.cursor_row and c == self.cursor_col
+                label = f"{row_letter}{string.ascii_uppercase[c]}" if row_letter else None
 
-                active = typed and label.startswith(typed)
-                line_color  = "#FFD700" if active else "#FFFFFF"
-                label_color = "#FFD700"
+                if not typed:
+                    draw.rectangle([x0, y0, x1 - 1, y1 - 1],
+                                   outline=(255, 255, 255, 38))
+                    if label and not CURSOR_MODE:
+                        self._draw_pill(draw, x0, y0, label, active=False)
+                elif row_match:
+                    draw.rectangle([x0, y0, x1, y1], fill=(255, 215, 0, 28))
+                    draw.rectangle([x0, y0, x1 - 1, y1 - 1],
+                                   outline=(255, 215, 0, 200))
+                    if label and not CURSOR_MODE:
+                        self._draw_pill(draw, x0, y0, label, active=True)
+                else:
+                    draw.rectangle([x0, y0, x1 - 1, y1 - 1],
+                                   outline=(255, 255, 255, 15))
+                    if label and not CURSOR_MODE:
+                        self._draw_pill(draw, x0, y0, label, active=None)
 
-                self.canvas.create_rectangle(
-                    x0, y0, x1, y1,
-                    fill="", outline=line_color, width=1, tags="overlay"
-                )
-                self.canvas.create_text(cx+1, cy+1, text=label,
-                    fill="black", font=("Menlo", fs, "bold"), tags="overlay")
-                self.canvas.create_text(cx, cy, text=label,
-                    fill=label_color, font=("Menlo", fs, "bold"), tags="overlay")
+                # Cursor cell: green selection border + subtle fill
+                if is_cursor:
+                    draw.rectangle([x0, y0, x1, y1], fill=(0, 255, 80, 25))
+                    draw.rectangle([x0 + 1, y0 + 1, x1 - 2, y1 - 2],
+                                   outline=(0, 255, 80, 255), width=2)
+
+        return Image.alpha_composite(base, overlay).convert("RGB")
+
+    def _draw_pill(self, draw, x0, y0, label, active=False):
+        """Draw a pill badge in top-left corner. active=True: bright, False: dim, None: ghost."""
+        pad = 3
+        try:
+            bbox = self._grid_font.getbbox(label)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        except AttributeError:
+            tw, th = len(label) * 7, 10
+        px0, py0 = x0 + 3, y0 + 3
+        px1, py1 = px0 + tw + pad * 2, py0 + th + pad * 2
+        if active is True:
+            bg    = (0, 0, 0, 200)
+            color = (0, 255, 110, 255)
+        elif active is False:
+            bg    = (0, 0, 0, 140)
+            color = (0, 200, 75, 255)
+        else:  # ghost: typing but not this row
+            bg    = (0, 0, 0, 70)
+            color = (0, 150, 55, 255)
+        draw.rectangle([px0, py0, px1, py1], fill=bg)
+        draw.text((px0 + pad, py0 + pad), label, fill=color, font=self._grid_font)
+
+    def redraw(self):
+        if self._raw_frame is not None:
+            composited = self._composite_grid(self._raw_frame)
+            self.photo = ImageTk.PhotoImage(composited)
+        self.canvas.itemconfig(self._img_id, image=self.photo or "")
 
     # ── Capture pipeline ──────────────────────────────────────────────────────
 
     def _start_stream(self):
         """Start scrcpy + ffmpeg pipeline. Falls back to screencap if unavailable."""
         if HAS_SCRCPY and HAS_FFMPEG:
+            # Show one screencap immediately while scrcpy connects
+            threading.Thread(target=self._initial_screencap, daemon=True).start()
             threading.Thread(target=self._scrcpy_stream, daemon=True).start()
         else:
             missing = []
@@ -203,9 +242,23 @@ class KeyTap:
             self.root.after(0, lambda: self.status(f"missing {','.join(missing)} - using screencap"))
             threading.Thread(target=self._screencap_loop, daemon=True).start()
 
+    def _initial_screencap(self):
+        """Take one screencap immediately so window isn't blank while scrcpy connects."""
+        try:
+            png = take_screencap()
+            if png and len(png) > 512:
+                img = Image.open(io.BytesIO(png))
+                img = img.resize((self.win_w, self.win_h), Image.BILINEAR)
+                try:
+                    self._frame_q.get_nowait()
+                except queue.Empty:
+                    pass
+                self._frame_q.put(img)
+        except Exception:
+            pass
+
     def _scrcpy_stream(self):
         """scrcpy → FIFO → ffmpeg → raw RGB24 frames."""
-        # Setup FIFO
         try:
             os.unlink(FIFO_PATH)
         except FileNotFoundError:
@@ -231,16 +284,18 @@ class KeyTap:
             "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"
         ]
 
+        t_start = time.time()
+        # Start both concurrently - FIFO open() blocks until both ends are open,
+        # no sleep needed; OS synchronizes reader/writer handshake.
         scrcpy_proc = subprocess.Popen(scrcpy_cmd, stderr=subprocess.DEVNULL)
-        # Small delay so scrcpy connects before ffmpeg opens FIFO
-        time.sleep(1.5)
         ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
         self._scrcpy_proc = scrcpy_proc
         self._ffmpeg_proc = ffmpeg_proc
-        self.root.after(0, lambda: self.status("streaming via scrcpy..."))
+        self.root.after(0, lambda: self.status("connecting scrcpy..."))
 
         frame_size = self.win_w * self.win_h * 3
+        first_frame = True
         while True:
             data = ffmpeg_proc.stdout.read(frame_size)
             if len(data) != frame_size:
@@ -250,6 +305,11 @@ class KeyTap:
                 time.sleep(1)
                 threading.Thread(target=self._scrcpy_stream, daemon=True).start()
                 return
+            if first_frame:
+                elapsed = time.time() - t_start
+                print(f"[keytap] first scrcpy frame in {elapsed:.2f}s", flush=True)
+                self.root.after(0, lambda e=elapsed: self.status(f"streaming  |  first frame in {e:.2f}s"))
+                first_frame = False
             img = Image.frombytes("RGB", (self.win_w, self.win_h), data)
             try:
                 self._frame_q.get_nowait()
@@ -284,17 +344,10 @@ class KeyTap:
         """Main thread: poll queue at ~60fps, update canvas only when new frame ready."""
         try:
             frame = self._frame_q.get_nowait()
-            if isinstance(frame, Image.Image):
-                self.photo = ImageTk.PhotoImage(frame)
-            elif HAS_PIL:
-                self.photo = ImageTk.PhotoImage(frame)
-            else:
-                self.photo = tk.PhotoImage(data=frame)
+            self._raw_frame = frame
+            composited = self._composite_grid(frame)
+            self.photo = ImageTk.PhotoImage(composited)
             self.canvas.itemconfig(self._img_id, image=self.photo)
-            self.canvas.delete("overlay")
-            if self.hint_mode:
-                self._draw_hints()
-            self._draw_cursor()
             self._idle_status()
         except queue.Empty:
             pass
@@ -303,30 +356,24 @@ class KeyTap:
     # ── ADB actions ──────────────────────────────────────────────────────────
 
     def do_tap(self, dx, dy):
-        self.cursor_x, self.cursor_y = dx, dy
         self.status(f"tap ({dx},{dy})")
-        self.redraw()
         threading.Thread(
             target=lambda: adb("shell", "input", "tap", str(dx), str(dy)),
             daemon=True
         ).start()
 
-    def do_swipe(self, direction):
-        cx, cy = self.cursor_x, self.cursor_y
-        d = self.SWIPE_DIST
-        coords = {
-            'Up':    (cx, cy, cx, cy - d),
-            'Down':  (cx, cy, cx, cy + d),
-            'Left':  (cx, cy, cx - d, cy),
-            'Right': (cx, cy, cx + d, cy),
-        }
-        if direction not in coords:
-            return
-        x1, y1, x2, y2 = coords[direction]
-        self.status(f"swipe {direction.lower()}")
+    def do_keyevent(self, code, label):
+        self.status(f"keyevent: {label}")
+        threading.Thread(
+            target=lambda: adb("shell", "input", "keyevent", str(code)),
+            daemon=True
+        ).start()
+
+    def do_swipe(self, x1, y1, x2, y2, duration=300, label="swipe"):
+        self.status(f"{label} ({x1},{y1})→({x2},{y2})")
         threading.Thread(
             target=lambda: adb("shell", "input", "swipe",
-                               str(x1), str(y1), str(x2), str(y2), str(self.SWIPE_MS)),
+                               str(x1), str(y1), str(x2), str(y2), str(duration)),
             daemon=True
         ).start()
 
@@ -336,10 +383,19 @@ class KeyTap:
         self.status_var.set(msg)
 
     def _idle_status(self):
-        if self.hint_mode:
-            self.status(f"hint: {''.join(self.hint_buf) or '_'}  (Esc=cancel)")
+        if CURSOR_MODE:
+            r, c = self.cursor_row, self.cursor_col
+            row_label = string.ascii_uppercase[r] if r < 26 else str(r + 1)
+            col_label = string.ascii_uppercase[c]
+            self.status(f"cursor: {row_label}{col_label} (row {r+1}, col {c+1})  |  arrows=move  Shift=jump5  space=tap  w/s=scroll  b=back  h=home  r=recents  Esc=quit")
         else:
-            self.status("f=hints  arrows=move  space=tap  s+arrow=swipe  r=refresh  Esc=quit")
+            buf = ''.join(self.input_buf).upper()
+            cols_range = string.ascii_uppercase[:ARGS.cols]
+            rows_range = string.ascii_uppercase[:min(ARGS.rows, 26)]
+            if len(buf) == 1:
+                self.status(f"row {buf} selected  →  type col ({cols_range[0]}-{cols_range[-1]})  |  Backspace=cancel")
+            else:
+                self.status(f"type row ({rows_range[0]}-{rows_range[-1]}) then col ({cols_range[0]}-{cols_range[-1]})  |  Esc=quit")
 
     # ── Key handler ──────────────────────────────────────────────────────────
 
@@ -347,89 +403,83 @@ class KeyTap:
         sym  = event.keysym
         char = event.char.upper() if event.char else ""
 
-        shift  = bool(event.state & 0x1)
-        option = bool(event.state & 0x8)
-
-        # ── swipe mode (after pressing s) ────────────────────────────────
-        if self.swipe_mode:
-            self.swipe_mode = False
-            if sym in ('Up', 'Down', 'Left', 'Right'):
-                self.do_swipe(sym)
-            else:
-                self.status("swipe cancelled")
-            return
-
-        # ── hint mode ────────────────────────────────────────────────────
-        if self.hint_mode:
-            if sym == 'Escape':
-                self.hint_mode = False
-                self.hint_buf.clear()
-                self.redraw()
-                self._idle_status()
-                return
-            if sym == 'BackSpace' and self.hint_buf:
-                self.hint_buf.pop()
-                self.redraw()
-                self._idle_status()
-                return
-            if char.isalpha() and not self.hint_buf:
-                self.hint_buf.append(char)
-                self.redraw()
-                self._idle_status()
-                return
-            if char.isdigit() and len(self.hint_buf) == 1:
-                self.hint_buf.append(char)
-                label = ''.join(self.hint_buf)
-                self.hint_mode = False
-                self.hint_buf.clear()
-                try:
-                    dx, dy = self.cell_to_dev(label)
-                    self.do_tap(dx, dy)
-                except ValueError:
-                    self.status(f"'{label}' out of range")
-                    self.redraw()
-                return
-            return
-
-        # ── normal mode ──────────────────────────────────────────────────
         if sym == 'Escape':
             self.root.destroy()
             return
 
-        if char in ('F',):
-            self.hint_mode = True
-            self.hint_buf.clear()
+        if CURSOR_MODE:
+            shift = bool(event.state & 0x1)
+            step  = CURSOR_JUMP if shift else 1
+            if sym == 'Up':
+                self.cursor_row = max(0, self.cursor_row - step)
+            elif sym == 'Down':
+                self.cursor_row = min(ARGS.rows - 1, self.cursor_row + step)
+            elif sym == 'Left':
+                self.cursor_col = max(0, self.cursor_col - step)
+            elif sym == 'Right':
+                self.cursor_col = min(ARGS.cols - 1, self.cursor_col + step)
+            elif sym == 'space':
+                dx, dy = self.cell_to_dev_rc(self.cursor_row, self.cursor_col)
+                self.do_tap(dx, dy)
+                return
+            elif char == 'B':
+                self.do_keyevent(4, "back")
+                return
+            elif char == 'H':
+                self.do_keyevent(3, "home")
+                return
+            elif char == 'R':
+                self.do_keyevent(187, "recents")
+                return
+            elif char in ('W', 'S'):
+                now = time.time()
+                if now - self._last_scroll_t < 0.4:
+                    return  # throttle: swipe still in flight, ignore repeat
+                self._last_scroll_t = now
+                cx, cy = self.cell_to_dev_rc(self.cursor_row, self.cursor_col)
+                dist = int(self.dev_h * 0.4)
+                if char == 'W':
+                    # scroll up: drag finger down → reveals items above
+                    y1 = max(cy - dist // 2, 0)
+                    y2 = min(cy + dist // 2, self.dev_h - 1)
+                    self.do_swipe(cx, y1, cx, y2, label="scroll up")
+                else:
+                    # scroll down: drag finger up → reveals items below
+                    y1 = min(cy + dist // 2, self.dev_h - 1)
+                    y2 = max(cy - dist // 2, 0)
+                    self.do_swipe(cx, y1, cx, y2, label="scroll down")
+                return
+            else:
+                return
             self.redraw()
             self._idle_status()
             return
 
-        if char in ('R',):
-            return  # capture loop is continuous
-
-        if char in ('S',):
-            self.swipe_mode = True
-            self.status("swipe: press arrow key")
+        # 2-letter label mode (active when CURSOR_MODE = False)
+        if sym == 'BackSpace':
+            if self.input_buf:
+                self.input_buf.pop()
+                self.redraw()
+                self._idle_status()
             return
 
-        if sym == 'space':
-            self.do_tap(self.cursor_x, self.cursor_y)
+        if char.isalpha() and not self.input_buf:
+            self.input_buf.append(char)
+            self.redraw()
+            self._idle_status()
             return
 
-        # cursor movement
-        step = self.STEP_FINE if option else (self.STEP_FAST if shift else self.STEP_NORMAL)
-        if sym == 'Up':
-            self.cursor_y = max(0, self.cursor_y - step)
-        elif sym == 'Down':
-            self.cursor_y = min(self.dev_h, self.cursor_y + step)
-        elif sym == 'Left':
-            self.cursor_x = max(0, self.cursor_x - step)
-        elif sym == 'Right':
-            self.cursor_x = min(self.dev_w, self.cursor_x + step)
-        else:
+        if char.isalpha() and len(self.input_buf) == 1:
+            self.input_buf.append(char)
+            label = ''.join(self.input_buf)
+            self.input_buf.clear()
+            try:
+                dx, dy = self.cell_to_dev(label)
+                self.do_tap(dx, dy)
+            except ValueError:
+                self.status(f"'{label}' out of range")
+            self.redraw()
             return
-
-        self.redraw()
-        self.status(f"cursor ({self.cursor_x},{self.cursor_y})")
 
     # ── Run ──────────────────────────────────────────────────────────────────
 
