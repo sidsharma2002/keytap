@@ -35,6 +35,7 @@ except ImportError:
 
 ADB_PATH   = "/Users/sidharthsharma/Library/Android/sdk/platform-tools/adb"
 CURSOR_MODE = True   # True = arrow-key cursor; False = 2-letter label typing
+CURSOR_JUMP = 5      # Shift+arrow jumps this many cells at once
 FIFO_PATH  = "/tmp/keytap_stream.fifo"
 HAS_SCRCPY = shutil.which("scrcpy") is not None
 HAS_FFMPEG = shutil.which("ffmpeg") is not None
@@ -360,6 +361,13 @@ class KeyTap:
             daemon=True
         ).start()
 
+    def do_keyevent(self, code, label):
+        self.status(f"keyevent: {label}")
+        threading.Thread(
+            target=lambda: adb("shell", "input", "keyevent", str(code)),
+            daemon=True
+        ).start()
+
     # ── Status ────────────────────────────────────────────────────────────────
 
     def status(self, msg):
@@ -370,7 +378,7 @@ class KeyTap:
             r, c = self.cursor_row, self.cursor_col
             row_label = string.ascii_uppercase[r] if r < 26 else str(r + 1)
             col_label = string.ascii_uppercase[c]
-            self.status(f"cursor: {row_label}{col_label} (row {r+1}, col {c+1})  |  arrows=move  space=tap  Esc=quit")
+            self.status(f"cursor: {row_label}{col_label} (row {r+1}, col {c+1})  |  arrows=move  Shift=jump5  space=tap  b=back  h=home  r=recents  Esc=quit")
         else:
             buf = ''.join(self.input_buf).upper()
             cols_range = string.ascii_uppercase[:ARGS.cols]
@@ -391,17 +399,28 @@ class KeyTap:
             return
 
         if CURSOR_MODE:
+            shift = bool(event.state & 0x1)
+            step  = CURSOR_JUMP if shift else 1
             if sym == 'Up':
-                self.cursor_row = max(0, self.cursor_row - 1)
+                self.cursor_row = max(0, self.cursor_row - step)
             elif sym == 'Down':
-                self.cursor_row = min(ARGS.rows - 1, self.cursor_row + 1)
+                self.cursor_row = min(ARGS.rows - 1, self.cursor_row + step)
             elif sym == 'Left':
-                self.cursor_col = max(0, self.cursor_col - 1)
+                self.cursor_col = max(0, self.cursor_col - step)
             elif sym == 'Right':
-                self.cursor_col = min(ARGS.cols - 1, self.cursor_col + 1)
+                self.cursor_col = min(ARGS.cols - 1, self.cursor_col + step)
             elif sym == 'space':
                 dx, dy = self.cell_to_dev_rc(self.cursor_row, self.cursor_col)
                 self.do_tap(dx, dy)
+                return
+            elif char == 'B':
+                self.do_keyevent(4, "back")
+                return
+            elif char == 'H':
+                self.do_keyevent(3, "home")
+                return
+            elif char == 'R':
+                self.do_keyevent(187, "recents")
                 return
             else:
                 return
