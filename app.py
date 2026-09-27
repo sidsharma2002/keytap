@@ -443,6 +443,17 @@ class KeyTap:
         elif action == "uninstall":
             actions.uninstall(pkg, on_status=self._set_status)
 
+    def _refocus_window(self):
+        """Return OS focus to the pygame window after palette closes."""
+        try:
+            subprocess.Popen(
+                ['osascript', '-e',
+                 f'tell application "System Events" to set frontmost of'
+                 f' process id {os.getpid()} to true'],
+            )
+        except Exception:
+            pass
+
     # ── Deeplink history ──────────────────────────────────────────────────────
 
     _DEEPLINK_PATH = os.path.expanduser("~/.keytap_deeplinks.json")
@@ -543,6 +554,7 @@ class KeyTap:
                 result = self._palette_result_q.get_nowait()
                 if result:
                     self._on_palette_action(result)
+                self._refocus_window()
             except queue.Empty:
                 pass
 
