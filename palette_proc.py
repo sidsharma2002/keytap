@@ -111,10 +111,10 @@ class PaletteWindow:
             pass
 
         # viewer state
-        self._viewer_all        = []
-        self._viewer_shown      = []
-        self._viewer_fetch_type = None   # tracks active inspector type
-        self._viewer_raw_items  = []     # raw (label, state) for dev-options / theme names
+        self._viewer_all       = []
+        self._viewer_shown     = []
+        self._viewer_raw_items = []      # raw (label, state) pairs for interactive viewers
+        self._viewer_on_enter  = None    # callable(idx) or None for read-only viewers
 
         # hierarchy state
         self._hier_nav_stack     = []   # [(nodes, label), ...]
@@ -314,10 +314,8 @@ class PaletteWindow:
             else:
                 self._emit({"type": "app-action", "pkg": self.sel_pkg, "action": vtype})
         elif self.state == "viewer":
-            if self._viewer_fetch_type == "dev-options":
-                self._toggle_dev_option(idx)
-            elif self._viewer_fetch_type == "themes":
-                self._apply_theme(idx)
+            if self._viewer_on_enter:
+                self._viewer_on_enter(idx)
         elif self.state == "input":
             text = self._var.get().strip()
             if text:
@@ -532,9 +530,18 @@ class PaletteWindow:
             "permissions":   f"Permissions – {short}",
             "dev-options":   "Dev Options",
         }.get(fetch_type, fetch_type)
+
+        # Set the Enter callback now — each interactive inspector owns its action.
+        # Read-only inspectors leave _viewer_on_enter = None.
+        if fetch_type == "dev-options":
+            self._viewer_on_enter = self._toggle_dev_option
+        elif fetch_type == "permissions":
+            self._viewer_on_enter = lambda idx, _pkg=pkg: self._toggle_permission(idx, _pkg)
+        else:
+            self._viewer_on_enter = None
+
         self.state = "viewer"
-        self._viewer_fetch_type = fetch_type
-        self._viewer_raw_items  = []
+        self._viewer_raw_items = []
         self._var.set("")
         self._prompt.config(text=f"{display}  >")
         self._lb.delete(0, "end")
@@ -546,6 +553,7 @@ class PaletteWindow:
 
     def _bg_fetch_viewer(self, fetch_type, pkg=None):
         raw_items = []
+        interactive = False
         try:
             if fetch_type == "shared-prefs":
                 from inspectors import shared_prefs as _m
@@ -563,10 +571,12 @@ class PaletteWindow:
                 from inspectors import permissions as _m
                 raw_items = _m.fetch(pkg)
                 label = f"Permissions – {pkg}"
+                interactive = True
             elif fetch_type == "dev-options":
                 from inspectors import dev_options as _m
                 raw_items = _m.fetch(self._serial)
                 label = "Dev Options"
+                interactive = True
             else:
                 raw_items = [("?", f"unsupported: {fetch_type}")]
                 label = fetch_type
@@ -575,20 +585,19 @@ class PaletteWindow:
             label = fetch_type
 
         # Format tuples as display strings
-        if fetch_type == "dev-options":
-            items = [f"  {k}  [{v}]" for k, v in raw_items]
-        else:
-            items = []
-            for it in raw_items:
-                if isinstance(it, (list, tuple)) and len(it) == 2:
-                    items.append(f"  {it[0]}  =  {it[1]}")
-                else:
-                    items.append(f"  {it}")
+        bracket = fetch_type == "dev-options"
+        items = []
+        for it in raw_items:
+            if isinstance(it, (list, tuple)) and len(it) == 2:
+                sep = f"  [{it[1]}]" if bracket else f"  =  {it[1]}"
+                items.append(f"  {it[0]}{sep}")
+            else:
+                items.append(f"  {it}")
 
-        self.root.after(0, lambda ri=raw_items, lbl=label, its=items:
-                        self._show_viewer_items(lbl, its, ri))
+        self.root.after(0, lambda ri=raw_items, lbl=label, its=items, ia=interactive:
+                        self._show_viewer_items(lbl, its, ri, ia))
 
-    def _show_viewer_items(self, title, items, raw_items=None):
+    def _show_viewer_items(self, title, items, raw_items=None, interactive=False):
         self._viewer_all       = list(items)
         self._viewer_shown     = list(items)
         self._viewer_raw_items = list(raw_items) if raw_items else []
@@ -596,7 +605,7 @@ class PaletteWindow:
         self._lb.delete(0, "end")
         for line in items:
             self._lb.insert("end", line)
-        hint = "Enter=toggle  " if self._viewer_fetch_type == "dev-options" else ""
+        hint = "Enter=toggle  " if interactive else ""
         self._footer.config(
             text=f"{len(items)} items  |  ↑↓=move  {hint}Esc=back"
         )
@@ -644,11 +653,33 @@ class PaletteWindow:
         self._lb.selection_set(idx)
         self._lb.activate(idx)
 
+    def _toggle_permission(self, idx, pkg):
+        if idx >= len(self._viewer_raw_items):
+            return
+        perm, _ = self._viewer_raw_items[idx]
+        self._lb.delete(idx)
+        self._lb.insert(idx, f"  {perm}  =  ...")
+        self._lb.selection_set(idx)
+        self._lb.activate(idx)
+        serial = self._serial
+        def _do():
+            try:
+                from inspectors import permissions as _m
+                new_state = _m.toggle(perm, pkg, serial)
+            except Exception as e:
+                new_state = f"err: {e}"
+            self._viewer_raw_items[idx] = (perm, new_state)
+            display = f"  {perm}  =  {new_state}"
+            if idx < len(self._viewer_all):
+                self._viewer_all[idx] = display
+            self.root.after(0, lambda: self._update_lb_item(idx, display))
+        threading.Thread(target=_do, daemon=True).start()
+
     # ── Theme switcher ────────────────────────────────────────────────────────
 
     def _enter_themes(self):
         self.state = "viewer"
-        self._viewer_fetch_type = "themes"
+        self._viewer_on_enter = self._apply_theme
         self._var.set("")
         self._prompt.config(text="Theme  >")
         try:

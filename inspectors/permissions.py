@@ -15,3 +15,18 @@ def fetch(pkg):
     except Exception as e:
         items = [("error", str(e))]
     return items
+
+
+def toggle(perm, pkg, serial=None):
+    """Grant or revoke a permission. Returns new state string."""
+    items = fetch(pkg)
+    current = next((s for p, s in items if p == perm), None)
+    try:
+        if current == "GRANTED":
+            adb("shell", "pm", "revoke", pkg, perm)
+            return "DENIED"
+        else:
+            adb("shell", "pm", "grant", pkg, perm)
+            return "GRANTED"
+    except Exception as e:
+        return f"err: {e}"
