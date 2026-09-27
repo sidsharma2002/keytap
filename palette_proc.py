@@ -111,10 +111,10 @@ class PaletteWindow:
             pass
 
         # viewer state
-        self._viewer_all       = []
-        self._viewer_shown     = []
-        self._viewer_raw_items = []      # raw (label, state) pairs for interactive viewers
-        self._viewer_on_enter  = None    # callable(idx) or None for read-only viewers
+        self._viewer_all          = []   # all formatted display strings (unfiltered)
+        self._viewer_raw_items    = []   # raw (label, state) pairs, parallel to _viewer_all
+        self._viewer_shown_idx    = []   # _viewer_all index for each listbox row (after filter)
+        self._viewer_on_enter     = None # callable(raw_idx) or None for read-only viewers
 
         # hierarchy state
         self._hier_nav_stack     = []   # [(nodes, label), ...]
@@ -599,9 +599,9 @@ class PaletteWindow:
 
     def _show_viewer_items(self, title, items, raw_items=None, interactive=False):
         self._viewer_all       = list(items)
-        self._viewer_shown     = list(items)
         self._viewer_raw_items = list(raw_items) if raw_items else []
         self._prompt.config(text=f"{title}  >")
+        self._viewer_shown_idx = list(range(len(items)))
         self._lb.delete(0, "end")
         for line in items:
             self._lb.insert("end", line)
@@ -615,24 +615,35 @@ class PaletteWindow:
 
     def _refresh_viewer(self):
         q = self._var.get().lower()
-        self._viewer_shown = [l for l in self._viewer_all if not q or q in l.lower()]
+        self._viewer_shown_idx = [
+            i for i, line in enumerate(self._viewer_all)
+            if not q or q in line.lower()
+        ]
         self._lb.delete(0, "end")
-        for line in self._viewer_shown:
-            self._lb.insert("end", line)
+        for i in self._viewer_shown_idx:
+            self._lb.insert("end", self._viewer_all[i])
+        hint = "Enter=toggle  " if self._viewer_on_enter else ""
         self._footer.config(
-            text=f"{len(self._viewer_shown)} items  |  ↑↓=move  Esc=back to search"
+            text=f"{len(self._viewer_shown_idx)} items  |  ↑↓=move  {hint}Esc=back"
         )
 
     # ── Dev options toggle ────────────────────────────────────────────────────
 
-    def _toggle_dev_option(self, idx):
-        if idx >= len(self._viewer_raw_items):
+    def _resolve_raw_idx(self, lb_idx):
+        """Map listbox position → _viewer_all / _viewer_raw_items index."""
+        if lb_idx < len(self._viewer_shown_idx):
+            return self._viewer_shown_idx[lb_idx]
+        return lb_idx  # fallback (unfiltered)
+
+    def _toggle_dev_option(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
             return
-        label, _ = self._viewer_raw_items[idx]
-        self._lb.delete(idx)
-        self._lb.insert(idx, f"  {label}  [...]")
-        self._lb.selection_set(idx)
-        self._lb.activate(idx)
+        label, _ = self._viewer_raw_items[raw_idx]
+        self._lb.delete(lb_idx)
+        self._lb.insert(lb_idx, f"  {label}  [...]")
+        self._lb.selection_set(lb_idx)
+        self._lb.activate(lb_idx)
         serial = self._serial
         def _do():
             try:
@@ -640,27 +651,27 @@ class PaletteWindow:
                 new_state = _m.toggle_by_label(label, serial)
             except Exception as e:
                 new_state = f"err: {e}"
-            self._viewer_raw_items[idx] = (label, new_state)
+            self._viewer_raw_items[raw_idx] = (label, new_state)
             display = f"  {label}  [{new_state}]"
-            if idx < len(self._viewer_all):
-                self._viewer_all[idx] = display
-            self.root.after(0, lambda: self._update_lb_item(idx, display))
+            self._viewer_all[raw_idx] = display
+            self.root.after(0, lambda: self._update_lb_item(lb_idx, display))
         threading.Thread(target=_do, daemon=True).start()
 
-    def _update_lb_item(self, idx, text):
-        self._lb.delete(idx)
-        self._lb.insert(idx, text)
-        self._lb.selection_set(idx)
-        self._lb.activate(idx)
+    def _update_lb_item(self, lb_idx, text):
+        self._lb.delete(lb_idx)
+        self._lb.insert(lb_idx, text)
+        self._lb.selection_set(lb_idx)
+        self._lb.activate(lb_idx)
 
-    def _toggle_permission(self, idx, pkg):
-        if idx >= len(self._viewer_raw_items):
+    def _toggle_permission(self, lb_idx, pkg):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
             return
-        perm, _ = self._viewer_raw_items[idx]
-        self._lb.delete(idx)
-        self._lb.insert(idx, f"  {perm}  =  ...")
-        self._lb.selection_set(idx)
-        self._lb.activate(idx)
+        perm, _ = self._viewer_raw_items[raw_idx]
+        self._lb.delete(lb_idx)
+        self._lb.insert(lb_idx, f"  {perm}  =  ...")
+        self._lb.selection_set(lb_idx)
+        self._lb.activate(lb_idx)
         serial = self._serial
         def _do():
             try:
@@ -668,11 +679,10 @@ class PaletteWindow:
                 new_state = _m.toggle(perm, pkg, serial)
             except Exception as e:
                 new_state = f"err: {e}"
-            self._viewer_raw_items[idx] = (perm, new_state)
+            self._viewer_raw_items[raw_idx] = (perm, new_state)
             display = f"  {perm}  =  {new_state}"
-            if idx < len(self._viewer_all):
-                self._viewer_all[idx] = display
-            self.root.after(0, lambda: self._update_lb_item(idx, display))
+            self._viewer_all[raw_idx] = display
+            self.root.after(0, lambda: self._update_lb_item(lb_idx, display))
         threading.Thread(target=_do, daemon=True).start()
 
     # ── Theme switcher ────────────────────────────────────────────────────────
@@ -690,8 +700,8 @@ class PaletteWindow:
             themes = []
             active = ""
         self._viewer_raw_items = themes
-        self._viewer_all   = [f"  {'* ' if t == active else '  '}{t}" for t in themes]
-        self._viewer_shown = list(self._viewer_all)
+        self._viewer_all       = [f"  {'* ' if t == active else '  '}{t}" for t in themes]
+        self._viewer_shown_idx = list(range(len(themes)))
         self._lb.delete(0, "end")
         for line in self._viewer_all:
             self._lb.insert("end", line)
@@ -700,10 +710,11 @@ class PaletteWindow:
             self._lb.selection_set(0)
             self._lb.activate(0)
 
-    def _apply_theme(self, idx):
-        if idx >= len(self._viewer_raw_items):
+    def _apply_theme(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
             return
-        name = self._viewer_raw_items[idx]
+        name = self._viewer_raw_items[raw_idx]
         try:
             import theme_manager
             theme_manager.set_theme(name)
@@ -715,7 +726,13 @@ class PaletteWindow:
 
     def _emit(self, result):
         self.result = result
-        self.root.destroy()
+        if getattr(self.root, '_persistent', False):
+            # Persistent mode: hide window and write result line to stdout.
+            # The process stays alive for the next open.
+            print(json.dumps(result), flush=True)
+            self.root.withdraw()
+        else:
+            self.root.destroy()
 
 
 # ── Viewer window ─────────────────────────────────────────────────────────────
@@ -791,9 +808,50 @@ class ViewerWindow:
         self.root.destroy()
 
 
+# ── Persistent mode ───────────────────────────────────────────────────────────
+
+def _persistent_main():
+    """Keep process alive. On each JSON line from stdin, re-open the palette.
+    Python + tkinter are already loaded, so the window appears with no startup lag.
+    Results are written line-by-line to stdout; __ready__ signals warm state via stderr."""
+    root = tk.Tk()
+    root.withdraw()          # start hidden
+    root._persistent = True  # signals _emit() to hide instead of destroy
+
+    sys.stderr.write("__ready__\n")
+    sys.stderr.flush()
+
+    palette_holder = [None]
+
+    def _do_open(data):
+        # Destroy previous palette widgets so __init__ can rebuild cleanly.
+        for widget in root.winfo_children():
+            widget.destroy()
+        root.deiconify()
+        palette_holder[0] = PaletteWindow(root, data)
+
+    def _stdin_loop():
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+                root.after(0, lambda d=data: _do_open(d))
+            except Exception:
+                pass
+
+    threading.Thread(target=_stdin_loop, daemon=True).start()
+    root.mainloop()
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
+    if "--persistent" in sys.argv:
+        _persistent_main()
+        return
+
     raw = sys.stdin.readline()
     if not raw.strip():
         print("null")
