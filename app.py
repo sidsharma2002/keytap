@@ -13,6 +13,7 @@ import actions
 import fonts
 from adb import adb, get_device_size, list_devices
 from capture import CaptureManager
+from capture_scrcpy import ScrcpyCaptureManager
 from config import ARGS, CURSOR_MODE, CURSOR_JUMP, ADB_PATH
 from element_manager import ElementManager
 from grid import GridRenderer
@@ -38,8 +39,9 @@ class KeyTap:
         pygame.display.set_caption("keytap")
 
         # ── Components ────────────────────────────────────────────────────────
-        self.capture  = CaptureManager(self.win_w, self.win_h, dev_w, dev_h,
-                                       on_status=self._set_status)
+        CaptureClass  = ScrcpyCaptureManager if ARGS.backend == "scrcpy" else CaptureManager
+        self.capture  = CaptureClass(self.win_w, self.win_h, dev_w, dev_h,
+                                     on_status=self._set_status)
         self.renderer = GridRenderer(self.win_w, self.win_h)
         self.renderer.init_fonts()
 
