@@ -162,6 +162,8 @@ class CommandPalette:
                 self._virtual.append(("  Theme — switch color theme", "theme-switcher", ""))
             if not ql or ql in "developer options":
                 self._virtual.append(("  Developer Options — toggle ADB debug settings", "dev-options", ""))
+            if not ql or ql in "install apk":
+                self._virtual.append(("  Install APK — install from file", "install-apk", ""))
             if ql and ql in "wifi":
                 self._virtual.append(("  WiFi — toggle", "quick-toggle", "wifi"))
             if ql and ql in "dark mode":

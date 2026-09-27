@@ -438,6 +438,9 @@ class KeyTap:
         )
 
     def _on_palette_action(self, pkg, action):
+        if pkg == "__install-apk__":
+            self.root.after(100, self._do_install_apk)
+            return
         if pkg == "__set-theme__":
             self.root.after(150, self._open_palette)
             return
@@ -507,6 +510,29 @@ class KeyTap:
         elif action == "permissions":
             self.status(f"reading permissions {pkg}...")
             threading.Thread(target=lambda p=pkg: self._fetch_permissions(p), daemon=True).start()
+
+    # ── APK installer ────────────────────────────────────────────────────────
+
+    def _do_install_apk(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Select APK to install",
+            filetypes=[("APK files", "*.apk"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        self.status(f"installing {os.path.basename(path)}...")
+        threading.Thread(target=lambda: self._run_install_apk(path), daemon=True).start()
+
+    def _run_install_apk(self, path):
+        result = adb("install", "-r", path)
+        out = (result.stdout + result.stderr).decode(errors="replace")
+        if "Success" in out:
+            msg = f"installed {os.path.basename(path)}"
+        else:
+            lines = [l.strip() for l in out.splitlines() if l.strip()]
+            msg = lines[-1] if lines else "install failed"
+        self.root.after(0, lambda: self.status(msg))
 
     # ── Inspector fetchers (delegate to inspectors package) ───────────────────
 
