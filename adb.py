@@ -4,6 +4,17 @@ import re
 from config import ADB_PATH, ARGS
 
 
+def list_devices():
+    """Return list of online device serials from `adb devices`."""
+    out = subprocess.run([ADB_PATH, "devices"], capture_output=True, timeout=10).stdout.decode()
+    devices = []
+    for line in out.splitlines()[1:]:  # skip "List of devices attached"
+        parts = line.strip().split()
+        if len(parts) >= 2 and parts[1] == "device":
+            devices.append(parts[0])
+    return devices
+
+
 def adb(*cmd):
     full = [ADB_PATH]
     if ARGS.serial:

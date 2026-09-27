@@ -610,6 +610,30 @@ class KeyTap:
 
 
 def main():
+    from adb import list_devices
+
+    if not ARGS.serial:
+        devices = list_devices()
+        if not devices:
+            print("No devices connected. Please connect a device and try again.")
+            sys.exit(1)
+        elif len(devices) == 1:
+            ARGS.serial = devices[0]
+            print(f"Device: {ARGS.serial}")
+        else:
+            print("Multiple devices found:")
+            for i, serial in enumerate(devices):
+                print(f"  [{i + 1}] {serial}")
+            while True:
+                try:
+                    choice = int(input(f"Select device [1-{len(devices)}]: ")) - 1
+                    if 0 <= choice < len(devices):
+                        ARGS.serial = devices[choice]
+                        break
+                    print(f"Enter a number between 1 and {len(devices)}")
+                except (ValueError, EOFError):
+                    print(f"Enter a number between 1 and {len(devices)}")
+
     print("connecting...")
     try:
         dev_w, dev_h = get_device_size()
