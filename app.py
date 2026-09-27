@@ -68,6 +68,13 @@ class KeyTap:
         # Deeplink history
         self._deeplinks        = []
 
+        # Stats overlay
+        self._stats_visible    = False
+        self._consumer_fps     = 0.0
+        self._consumer_frames  = 0
+        self._consumer_t       = 0.0
+        self._render_ms        = 0.0
+
         # Status font
         self._status_font = self._try_font(11)
 
@@ -150,6 +157,11 @@ class KeyTap:
         # Quit
         if sym == pygame.K_ESCAPE:
             return False
+
+        # Stats overlay toggle
+        if sym == pygame.K_F1:
+            self._stats_visible = not self._stats_visible
+            return True
 
         # Double-shift → palette
         if sym in (pygame.K_LSHIFT, pygame.K_RSHIFT):
@@ -539,6 +551,8 @@ class KeyTap:
             self.screen.blit(composited, (0, 0))
 
         self._draw_status()
+        if self._stats_visible:
+            self._draw_stats()
         pygame.display.flip()
 
     def _draw_status(self):
@@ -548,6 +562,31 @@ class KeyTap:
         if self._status_font:
             t = self._status_font.render(self._status[:120], True, (136, 136, 136))
             self.screen.blit(t, (8, bar_y + (STATUS_H - t.get_height()) // 2))
+
+    def _draw_stats(self):
+        s    = self.capture.stats
+        font = self._status_font
+        if not font:
+            return
+        lines = [
+            ("F1 hide stats",                           (90,  90,  90)),
+            (f"producer  {s['producer_fps']:.0f} fps",  (0,  210,  90)),
+            (f"dropped   {s['dropped_ps']} /s",         (220, 120,  40) if s['dropped_ps'] else (0, 210, 90)),
+            (f"stall     {s['stall_ms']:.0f} ms",       (220, 120,  40) if s['stall_ms'] > 50 else (0, 210, 90)),
+            (f"consumer  {self._consumer_fps:.0f} fps", (0,  210,  90)),
+            (f"render    {self._render_ms:.1f} ms",     (220, 120,  40) if self._render_ms > 8 else (0, 210, 90)),
+        ]
+        pad    = 6
+        line_h = font.get_height() + 4
+        box_w  = 190
+        box_h  = len(lines) * line_h + pad * 2
+        x      = self.win_w - box_w - 10
+        y      = 10
+        pygame.draw.rect(self.screen, (12, 12, 12),  (x - pad, y - pad, box_w + pad * 2, box_h))
+        pygame.draw.rect(self.screen, (55, 55, 55),  (x - pad, y - pad, box_w + pad * 2, box_h), 1)
+        for i, (text, color) in enumerate(lines):
+            surf = font.render(text, True, color)
+            self.screen.blit(surf, (x, y + i * line_h))
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
@@ -585,6 +624,15 @@ class KeyTap:
                 if self.elements.active and not self.elements.loading:
                     if self.elements.check_screen_change(self._raw_surf):
                         self.elements.enter(ref_surf=self._raw_surf)
+                # Consumer fps accounting
+                self._consumer_frames += 1
+                now = time.time()
+                if self._consumer_t == 0.0:
+                    self._consumer_t = now
+                elif now - self._consumer_t >= 1.0:
+                    self._consumer_fps = self._consumer_frames / (now - self._consumer_t)
+                    self._consumer_frames = 0
+                    self._consumer_t = now
 
             # Process palette subprocess results
             try:
@@ -595,7 +643,9 @@ class KeyTap:
             except queue.Empty:
                 pass
 
+            t_draw = time.time()
             self._draw()
+            self._render_ms = (time.time() - t_draw) * 1000
             self.clock.tick(120)
 
         self.capture.stop()

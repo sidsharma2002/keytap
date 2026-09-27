@@ -30,6 +30,12 @@ class CaptureManager:
         self.low_latency = bool(cap.get("low_latency", False))
         self.fps_cap     = int(cap.get("fps_cap", 0))
 
+        # Live stats (read by main thread, written by capture thread — GIL safe)
+        self.stats       = {"producer_fps": 0.0, "dropped_ps": 0, "stall_ms": 0.0}
+        self._stat_prod  = 0
+        self._stat_drop  = 0
+        self._stat_t     = 0.0
+
     def start(self):
         if HAS_FFMPEG:
             threading.Thread(target=self._h264_loop, daemon=True).start()
@@ -59,9 +65,21 @@ class CaptureManager:
     def _enqueue(self, frame):
         try:
             self.frame_q.get_nowait()
+            self._stat_drop += 1
         except queue.Empty:
             pass
         self.frame_q.put(frame)
+        self._stat_prod += 1
+        now = time.time()
+        if self._stat_t == 0.0:
+            self._stat_t = now
+        elif now - self._stat_t >= 1.0:
+            elapsed = now - self._stat_t
+            self.stats["producer_fps"] = round(self._stat_prod / elapsed, 1)
+            self.stats["dropped_ps"]   = self._stat_drop
+            self._stat_prod = 0
+            self._stat_drop = 0
+            self._stat_t    = now
 
     def _adb_args(self):
         """Return base adb arg list with -s serial if set."""
@@ -136,7 +154,12 @@ class CaptureManager:
 
         try:
             while self._running:
+                t0   = time.time()
                 data = ffmpeg_proc.stdout.read(frame_bytes)
+                stall_ms = (time.time() - t0) * 1000
+                self.stats["stall_ms"] = round(
+                    0.8 * self.stats["stall_ms"] + 0.2 * stall_ms, 1
+                )
                 if len(data) != frame_bytes:
                     # Stream ended (device disconnected, 3-min limit, etc.)
                     elapsed = time.time() - t_start
