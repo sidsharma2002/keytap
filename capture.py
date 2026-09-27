@@ -28,6 +28,7 @@ class CaptureManager:
         cap = _s("capture")
         self.bitrate     = str(cap.get("bitrate", "8000000"))
         self.low_latency = bool(cap.get("low_latency", False))
+        self.fps_cap     = int(cap.get("fps_cap", 0))
 
     def start(self):
         if HAS_FFMPEG:
@@ -39,12 +40,14 @@ class CaptureManager:
     def stop(self):
         self._running = False
 
-    def restart_with_settings(self, bitrate=None, low_latency=None):
+    def restart_with_settings(self, bitrate=None, low_latency=None, fps_cap=None):
         """Apply new capture settings and restart the stream immediately."""
         if bitrate is not None:
             self.bitrate = str(bitrate)
         if low_latency is not None:
             self.low_latency = bool(low_latency)
+        if fps_cap is not None:
+            self.fps_cap = int(fps_cap)
         if self._adb_proc:
             try:
                 self._adb_proc.terminate()
@@ -101,9 +104,12 @@ class CaptureManager:
             ffmpeg_cmd += ["-flags", "low_delay", "-fflags", "nobuffer+discardcorrupt",
                            "-probesize", "2048", "-analyzeduration", "100000",
                            "-avioflags", "direct"]
+        vf = f"scale={self.win_w}:{self.win_h}"
+        if self.fps_cap > 0:
+            vf += f",fps={self.fps_cap}"
         ffmpeg_cmd += [
             "-i", "pipe:0",
-            "-vf", f"scale={self.win_w}:{self.win_h}",
+            "-vf", vf,
             "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
         ]
 

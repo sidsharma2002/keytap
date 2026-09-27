@@ -268,8 +268,9 @@ class KeyTap:
             "deeplinks":          self._deeplinks,
             "serial":             ARGS.serial,
             "adb_path":           ADB_PATH,
-            "capture_bitrate":    self.capture.bitrate,
+            "capture_bitrate":     self.capture.bitrate,
             "capture_low_latency": self.capture.low_latency,
+            "capture_fps_cap":     self.capture.fps_cap,
         }
         if self._palette_proc and self._palette_ready:
             # Fast path: pre-warmed subprocess already has Python + tkinter loaded.
@@ -433,13 +434,14 @@ class KeyTap:
 
         elif t == 'capture-settings':
             import settings as _settings_mod
-            updates = {k: result[k] for k in ('bitrate', 'low_latency') if k in result}
+            updates = {k: result[k] for k in ('bitrate', 'low_latency', 'fps_cap') if k in result}
             if updates:
                 _settings_mod.save_section('capture', updates)
                 self.capture.restart_with_settings(**updates)
                 mbps = int(self.capture.bitrate) // 1_000_000
-                ll = " + low latency" if self.capture.low_latency else ""
-                self._set_status(f"capture: {mbps}Mbps{ll} – restarting stream...")
+                ll  = " + low latency" if self.capture.low_latency else ""
+                fps = f" + {self.capture.fps_cap}fps cap" if self.capture.fps_cap > 0 else ""
+                self._set_status(f"capture: {mbps}Mbps{ll}{fps} – restarting stream...")
 
         elif t == 'app-action':
             self._dispatch_app_action(result['pkg'], result['action'])

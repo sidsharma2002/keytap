@@ -41,6 +41,7 @@ _DEFAULTS = {
     "capture": {
         "bitrate":        "8000000",
         "low_latency":    False,
+        "fps_cap":        0,        # 0 = no cap (native device fps)
     },
     # Display / grid (can also be set via CLI args, args take priority)
     "display": {

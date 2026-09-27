@@ -78,6 +78,13 @@ _BITRATE_PRESETS = [
     ("16 Mbps – best quality",  "16000000"),
 ]
 
+_FPS_PRESETS = [
+    ("Off  – native device fps",        0),
+    ("15 fps  – low bandwidth",         15),
+    ("24 fps  – film-like",             24),
+    ("30 fps  – balanced (recommended)", 30),
+]
+
 APP_ACTIONS = [
     ("  Launch",        "launch"),
     ("  Force Stop",    "force-stop"),
@@ -342,6 +349,8 @@ class PaletteWindow:
             elif vtype == "cap-latency":
                 cur_ll = bool(self.data.get("capture_low_latency", False))
                 self._emit({"type": "capture-settings", "low_latency": not cur_ll})
+            elif vtype == "cap-fps":
+                self._emit({"type": "capture-settings", "fps_cap": vvalue})
         elif self.state == "input":
             text = self._var.get().strip()
             if text:
@@ -782,8 +791,9 @@ class PaletteWindow:
         self._var.set("")
         self._prompt.config(text="capture  >")
         self._footer.config(text="Enter=apply  Esc=back")
-        cur_br = str(self.data.get("capture_bitrate", "8000000"))
-        cur_ll = bool(self.data.get("capture_low_latency", False))
+        cur_br  = str(self.data.get("capture_bitrate", "8000000"))
+        cur_ll  = bool(self.data.get("capture_low_latency", False))
+        cur_fps = int(self.data.get("capture_fps_cap", 0))
         items = []
         for label, val in _BITRATE_PRESETS:
             dot = "●" if val == cur_br else " "
@@ -791,6 +801,9 @@ class PaletteWindow:
         dot = "●" if cur_ll else " "
         ll_str = "ON" if cur_ll else "OFF"
         items.append((f"  {dot}  Low Latency: {ll_str}", "cap-latency", "toggle"))
+        for label, val in _FPS_PRESETS:
+            dot = "●" if val == cur_fps else " "
+            items.append((f"  {dot}  FPS Cap: {label}", "cap-fps", val))
         self._shown = items
         self._set_items(items)
 
