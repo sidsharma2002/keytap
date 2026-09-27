@@ -405,6 +405,8 @@ class PaletteWindow:
 
     # ── Hierarchy state ───────────────────────────────────────────────────────
 
+    _FETCH_TIMEOUT = 20  # seconds before fetch is considered hung
+
     def _enter_hierarchy_loading(self):
         print("[DEBUG][palette_proc] _enter_hierarchy_loading called", file=sys.stderr, flush=True)
         self.state = "hierarchy"
@@ -422,19 +424,26 @@ class PaletteWindow:
         threading.Thread(target=self._bg_fetch_hierarchy, daemon=True).start()
 
     def _bg_fetch_hierarchy(self):
+        import concurrent.futures
         import time as _t
         _t0 = _t.time()
         print(f"[DEBUG][hierarchy] fetch start, u2 preconnected={_u2_dev is not None}", file=sys.stderr, flush=True)
         try:
             from inspectors.hierarchy import dump_hierarchy_tree
-            root_node, flat_nodes = dump_hierarchy_tree(self._serial, u2_dev=_u2_dev)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(dump_hierarchy_tree, self._serial, _u2_dev)
+                root_node, flat_nodes = fut.result(timeout=self._FETCH_TIMEOUT)
             _elapsed = _t.time() - _t0
             print(f"[DEBUG][hierarchy] fetch done in {_elapsed:.2f}s, {len(flat_nodes)} nodes", file=sys.stderr, flush=True)
             self.root.after(0, lambda: self._show_hierarchy(root_node, flat_nodes))
+        except concurrent.futures.TimeoutError:
+            _elapsed = _t.time() - _t0
+            print(f"[DEBUG][hierarchy] fetch timed out after {_elapsed:.2f}s", file=sys.stderr, flush=True)
+            self.root.after(0, lambda: self._show_fetch_error("timed out — device not responding"))
         except Exception as e:
             _elapsed = _t.time() - _t0
             print(f"[DEBUG][hierarchy] fetch error after {_elapsed:.2f}s: {e}", file=sys.stderr, flush=True)
-            self.root.after(0, lambda: self._footer.config(text=f"error: {e}"))
+            self.root.after(0, lambda: self._show_fetch_error(str(e)))
 
     def _show_hierarchy(self, root_node, flat_nodes):
         self._hier_all_flat = flat_nodes
@@ -562,46 +571,53 @@ class PaletteWindow:
             target=self._bg_fetch_viewer, args=(fetch_type, pkg), daemon=True
         ).start()
 
+    def _show_fetch_error(self, msg):
+        self._lb.delete(0, "end")
+        self._lb.insert("end", f"  error: {msg}")
+        self._footer.config(text=f"fetch failed — Esc=back")
+
     def _bg_fetch_viewer(self, fetch_type, pkg=None):
+        import concurrent.futures
         import time as _t
         _t0 = _t.time()
         print(f"[DEBUG][viewer] fetch start: {fetch_type}", file=sys.stderr, flush=True)
-        raw_items = []
         interactive = False
-        try:
+
+        def _do_fetch():
             if fetch_type == "shared-prefs":
                 from inspectors import shared_prefs as _m
-                raw_items = _m.fetch(pkg)
-                label = f"Shared Prefs – {pkg}"
+                return _m.fetch(pkg), f"Shared Prefs – {pkg}", False
             elif fetch_type == "remote-config":
                 from inspectors import remote_config as _m
-                raw_items = _m.fetch(pkg)
-                label = f"Remote Config – {pkg}"
+                return _m.fetch(pkg), f"Remote Config – {pkg}", False
             elif fetch_type == "litmus":
                 from inspectors import litmus as _m
-                raw_items, _ = _m.fetch(pkg)
-                label = f"Litmus – {pkg}"
+                items, _ = _m.fetch(pkg)
+                return items, f"Litmus – {pkg}", False
             elif fetch_type == "permissions":
                 from inspectors import permissions as _m
-                raw_items = _m.fetch(pkg)
-                label = f"Permissions – {pkg}"
-                interactive = True
+                return _m.fetch(pkg), f"Permissions – {pkg}", True
             elif fetch_type == "dev-options":
                 from inspectors import dev_options as _m
-                raw_items = _m.fetch(self._serial)
-                label = "Dev Options"
-                interactive = True
+                return _m.fetch(self._serial), "Dev Options", True
             else:
-                raw_items = [("?", f"unsupported: {fetch_type}")]
-                label = fetch_type
+                return [("?", f"unsupported: {fetch_type}")], fetch_type, False
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(_do_fetch)
+                raw_items, label, interactive = fut.result(timeout=self._FETCH_TIMEOUT)
+            _elapsed = _t.time() - _t0
+            print(f"[DEBUG][viewer] fetch done in {_elapsed:.2f}s, {len(raw_items)} items", file=sys.stderr, flush=True)
+        except concurrent.futures.TimeoutError:
+            _elapsed = _t.time() - _t0
+            print(f"[DEBUG][viewer] fetch timed out after {_elapsed:.2f}s", file=sys.stderr, flush=True)
+            self.root.after(0, lambda: self._show_fetch_error("timed out — device not responding"))
+            return
         except Exception as e:
-            raw_items = [("error", str(e))]
-            label = fetch_type
             _elapsed = _t.time() - _t0
             print(f"[DEBUG][viewer] fetch error after {_elapsed:.2f}s: {e}", file=sys.stderr, flush=True)
-
-        _elapsed = _t.time() - _t0
-        print(f"[DEBUG][viewer] fetch done in {_elapsed:.2f}s, {len(raw_items)} items", file=sys.stderr, flush=True)
+            raw_items, label, interactive = [("error", str(e))], fetch_type, False
         # Format tuples as display strings
         bracket = fetch_type == "dev-options"
         items = []
