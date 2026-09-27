@@ -659,6 +659,9 @@ def main():
                     print(f"Enter a number between 1 and {len(devices)}")
                 except (ValueError, EOFError):
                     print(f"Enter a number between 1 and {len(devices)}")
+                except KeyboardInterrupt:
+                    print()
+                    sys.exit(0)
 
     print("connecting...")
     try:
