@@ -2,33 +2,40 @@ import subprocess
 import threading
 import queue
 import time
-import io
-import os
 
 from PIL import Image
 
-from config import ARGS, FIFO_PATH, HAS_SCRCPY, HAS_FFMPEG
+from config import ARGS, HAS_FFMPEG
 from adb import adb, take_screencap
 
 
 class CaptureManager:
-    """Manages the video capture pipeline. Produces PIL frames into frame_q."""
+    """h264 pipe capture: screenrecord -> ffmpeg -> PIL frames.
+
+    Falls back to per-frame screencap if ffmpeg is missing.
+    frame_q always contains PIL RGB Images sized (win_w, win_h).
+    """
+
+    BITRATE = "8000000"
 
     def __init__(self, win_w, win_h, on_status):
-        self.win_w        = win_w
-        self.win_h        = win_h
-        self._on_status   = on_status   # callable(msg: str) - must be thread-safe
-        self.frame_q      = queue.Queue(maxsize=1)
-        self._scrcpy_live = threading.Event()  # set when scrcpy stream produces first frame
+        self.win_w      = win_w
+        self.win_h      = win_h
+        self._on_status = on_status   # callable(str), must be thread-safe
+        self.frame_q    = queue.Queue(maxsize=1)
+        self._running   = True
 
     def start(self):
-        if HAS_SCRCPY and HAS_FFMPEG:
-            threading.Thread(target=self._screencap_until_live, daemon=True).start()
-            threading.Thread(target=self._scrcpy_stream, daemon=True).start()
+        if HAS_FFMPEG:
+            threading.Thread(target=self._h264_loop, daemon=True).start()
         else:
-            missing = [x for x, ok in [("scrcpy", HAS_SCRCPY), ("ffmpeg", HAS_FFMPEG)] if not ok]
-            self._on_status(f"missing {','.join(missing)} - using screencap")
+            self._on_status("ffmpeg missing - using screencap (slow)")
             threading.Thread(target=self._screencap_loop, daemon=True).start()
+
+    def stop(self):
+        self._running = False
+
+    # ── Internal helpers ─────────────────────────────────────────────────────
 
     def _enqueue(self, frame):
         try:
@@ -37,76 +44,112 @@ class CaptureManager:
             pass
         self.frame_q.put(frame)
 
-    def _png_to_frame(self, png):
-        img = Image.open(io.BytesIO(png))
-        return img.resize((self.win_w, self.win_h), Image.BILINEAR)
-
-    def _screencap_until_live(self):
-        """Poll screencap every 2s while scrcpy is connecting, stop once stream is live."""
-        while not self._scrcpy_live.is_set():
-            try:
-                png = take_screencap()
-                if png and len(png) > 512:
-                    self._enqueue(self._png_to_frame(png))
-            except Exception:
-                pass
-            self._scrcpy_live.wait(timeout=2.0)
-
-    def _scrcpy_stream(self):
-        try:
-            os.unlink(FIFO_PATH)
-        except FileNotFoundError:
-            pass
-        os.mkfifo(FIFO_PATH)
-
-        scrcpy_cmd = ["scrcpy", "--record", FIFO_PATH, "--record-format=mkv",
-                      "--no-video-playback", "--no-audio"]
+    def _adb_args(self):
+        """Return base adb arg list with -s serial if set."""
+        from config import ADB_PATH
+        args = [ADB_PATH]
         if ARGS.serial:
-            scrcpy_cmd += [f"--serial={ARGS.serial}"]
+            args += ["-s", ARGS.serial]
+        return args
 
-        # NOTE: -fflags nobuffer breaks the matroska demuxer (0 frames produced).
-        # Root cause: nobuffer prevents the MKV Tracks element from being buffered,
-        # so the demuxer never finds a decodable video stream.
-        # -analyzeduration 0 also breaks FIFO input: ffmpeg does a non-blocking open,
-        # gets nothing before scrcpy connects (~8s), and immediately exits with 0 frames.
+    # ── h264 pipeline ────────────────────────────────────────────────────────
+
+    def _h264_loop(self):
+        """Outer restart loop - handles screenrecord 3-min limit."""
+        consecutive_failures = 0
+        while self._running:
+            ok = self._h264_session()
+            if ok:
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+                if consecutive_failures >= 3:
+                    self._on_status("stream failing repeatedly - check device")
+                    time.sleep(5)
+                    consecutive_failures = 0
+                else:
+                    time.sleep(1)
+
+    def _h264_session(self):
+        """One screenrecord session. Returns True if it ran for a meaningful time."""
+        frame_bytes = self.win_w * self.win_h * 3  # RGB24
+
+        adb_cmd = self._adb_args() + [
+            "shell", "screenrecord",
+            "--output-format=h264",
+            f"--bit-rate={self.BITRATE}",
+            "-",
+        ]
         ffmpeg_cmd = [
-            "ffmpeg",
-            "-flags", "low_delay",
-            "-f", "matroska", "-i", FIFO_PATH,
+            "ffmpeg", "-loglevel", "quiet",
+            "-hwaccel", "videotoolbox",
+            "-i", "pipe:0",
             "-vf", f"scale={self.win_w}:{self.win_h}",
             "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
         ]
 
-        t_start     = time.time()
-        scrcpy_proc = subprocess.Popen(scrcpy_cmd, stderr=subprocess.DEVNULL)
-        ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        self._on_status("connecting scrcpy...")
+        try:
+            adb_proc = subprocess.Popen(
+                adb_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            ffmpeg_proc = subprocess.Popen(
+                ffmpeg_cmd,
+                stdin=adb_proc.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as e:
+            self._on_status(f"capture start error: {e}")
+            return False
 
-        frame_size  = self.win_w * self.win_h * 3
+        t_start     = time.time()
         first_frame = True
-        while True:
-            data = ffmpeg_proc.stdout.read(frame_size)
-            if len(data) != frame_size:
-                self._on_status("stream ended - restarting...")
-                ffmpeg_proc.wait()
-                scrcpy_proc.wait()
-                time.sleep(1)
-                threading.Thread(target=self._scrcpy_stream, daemon=True).start()
-                return
-            if first_frame:
-                elapsed = time.time() - t_start
-                print(f"[keytap] first scrcpy frame in {elapsed:.2f}s", flush=True)
-                self._on_status(f"streaming  |  first frame in {elapsed:.2f}s")
-                self._scrcpy_live.set()  # stop screencap polling
-                first_frame = False
-            self._enqueue(Image.frombytes("RGB", (self.win_w, self.win_h), data))
+        frame_count = 0
+
+        try:
+            while self._running:
+                data = ffmpeg_proc.stdout.read(frame_bytes)
+                if len(data) != frame_bytes:
+                    # Stream ended (device disconnected, 3-min limit, etc.)
+                    elapsed = time.time() - t_start
+                    if frame_count > 0:
+                        self._on_status("stream ended - restarting...")
+                    return frame_count > 10  # considered successful if we got frames
+
+                frame = Image.frombuffer("RGB", (self.win_w, self.win_h), data)
+                self._enqueue(frame)
+                frame_count += 1
+
+                if first_frame:
+                    elapsed = time.time() - t_start
+                    self._on_status(f"streaming  |  first frame {elapsed:.2f}s")
+                    first_frame = False
+
+        finally:
+            try:
+                adb_proc.terminate()
+            except Exception:
+                pass
+            try:
+                ffmpeg_proc.terminate()
+            except Exception:
+                pass
+
+        return frame_count > 10
+
+    # ── Screencap fallback ───────────────────────────────────────────────────
 
     def _screencap_loop(self):
-        while True:
+        import io
+        while self._running:
             try:
                 png = take_screencap()
                 if png and len(png) > 512:
-                    self._enqueue(self._png_to_frame(png))
+                    img = Image.open(io.BytesIO(png))
+                    frame = img.resize((self.win_w, self.win_h), Image.BILINEAR)
+                    self._enqueue(frame)
                 else:
                     time.sleep(0.5)
             except Exception as e:

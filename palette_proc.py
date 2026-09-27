@@ -1,0 +1,673 @@
+"""
+Palette subprocess: native macOS tkinter window.
+Reads one JSON line from stdin, writes one JSON line to stdout on close.
+
+Input JSON keys:
+  mode      : "palette" | "viewer"
+  packages  : [str, ...]          (palette mode)
+  clipboard : str                 (palette mode)
+  deeplinks : [str, ...]          (palette mode)
+  serial    : str | null          (palette mode)
+  title     : str                 (viewer mode)
+  items     : [[key,val], ...]    (viewer mode - key/value pairs)
+
+Output JSON:
+  null                            cancelled
+  {"type": "launch",        "pkg": str}
+  {"type": "force-stop",    "pkg": str}
+  {"type": "clear-data",    "pkg": str}
+  {"type": "uninstall",     "pkg": str}
+  {"type": "app-action",    "pkg": str, "action": str}
+  {"type": "input-text",    "text": str}
+  {"type": "view-hierarchy"}
+  {"type": "memory"}
+  {"type": "install-apk"}
+  {"type": "dev-options"}
+  {"type": "clipboard"}
+  {"type": "deeplink",      "value": str}
+"""
+import json
+import re
+import sys
+import threading
+import tkinter as tk
+import tkinter.filedialog as filedialog
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+
+C = {
+    'bg':      '#1c1c1e',
+    'bg2':     '#2c2c2e',
+    'fg':      '#f0f0f0',
+    'dim':     '#888888',
+    'accent':  '#00c864',
+    'sel':     '#3a3a3c',
+    'sel_fg':  '#00c864',
+    'border':  '#3a3a3c',
+}
+
+FONT_MONO  = ("Menlo", 13)
+FONT_SMALL = ("Menlo", 11)
+
+# ── Built-in commands ─────────────────────────────────────────────────────────
+
+BUILT_IN = [
+    ("  View Hierarchy    – browse UI tree",    "view-hierarchy"),
+    ("  Memory Watchdog   – live RAM stats",    "memory"),
+    ("  Input Text        – send to device",    "input-text"),
+    ("  Dev Options       – toggle ADB settings","dev-options"),
+    ("  Install APK       – install from file", "install-apk"),
+]
+
+APP_ACTIONS = [
+    ("  Launch",        "launch"),
+    ("  Force Stop",    "force-stop"),
+    ("  Clear Data",    "clear-data"),
+    ("  Uninstall",     "uninstall"),
+    ("  Shared Prefs",  "shared-prefs"),
+    ("  Remote Config", "remote-config"),
+    ("  Litmus",        "litmus"),
+    ("  Permissions",   "permissions"),
+]
+
+_DEEPLINK_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9+\-.]*://.+')
+
+
+# ── Palette window ────────────────────────────────────────────────────────────
+
+class PaletteWindow:
+    W, H = 540, 480
+
+    def __init__(self, root, data):
+        self.root    = root
+        self.data    = data
+        self.result  = None
+        self.state   = "search"    # search | actions | input | viewer | hierarchy
+        self.sel_pkg = None
+
+        self._adb_path = data.get("adb_path", "adb")
+        self._serial   = data.get("serial") or None
+
+        # viewer state
+        self._viewer_all   = []
+        self._viewer_shown = []
+
+        # hierarchy state
+        self._hier_nav_stack     = []   # [(nodes, label), ...]
+        self._hier_current_nodes = []
+        self._hier_current_label = "root"
+        self._hier_all_flat      = []
+        self._hier_shown         = []
+
+        # ── Packages + built-ins ──────────────────────────────────────────────
+        self._pkgs = data.get("packages", [])
+        self._deeplinks = data.get("deeplinks", [])
+        self._clipboard = data.get("clipboard", "")
+
+        # Build full item list: (display, type, value)
+        self._all_items = []
+        for label, vtype in BUILT_IN:
+            self._all_items.append((label, vtype, None))
+        # Clipboard
+        clip = self._clipboard.strip()
+        if clip:
+            short = clip[:60] + ("..." if len(clip) > 60 else "")
+            self._all_items.append((f"  Clipboard        – {short}", "clipboard", clip))
+        # Deeplinks
+        for dl in self._deeplinks:
+            short = dl[:60] + ("..." if len(dl) > 60 else "")
+            self._all_items.append((f"  Deeplink         – {short}", "deeplink", dl))
+        # Packages
+        for pkg in self._pkgs:
+            self._all_items.append((f"  {pkg}", "pkg", pkg))
+
+        self._shown = list(self._all_items)
+
+        # ── Build UI ──────────────────────────────────────────────────────────
+        root.title("keytap")
+        root.geometry(f"{self.W}x{self.H}")
+        root.configure(bg=C['bg'])
+        root.resizable(False, False)
+        root.attributes("-topmost", True)
+
+        # Search bar frame
+        bar_frame = tk.Frame(root, bg=C['bg2'], pady=0)
+        bar_frame.pack(fill="x", padx=0, pady=0)
+
+        self._prompt = tk.Label(bar_frame, text=">", bg=C['bg2'], fg=C['accent'],
+                                font=FONT_MONO, padx=8, pady=10)
+        self._prompt.pack(side="left")
+
+        self._var = tk.StringVar()
+        self._entry = tk.Entry(bar_frame, textvariable=self._var,
+                               bg=C['bg2'], fg=C['fg'],
+                               insertbackground=C['fg'],
+                               font=FONT_MONO, relief="flat", bd=0)
+        self._entry.pack(side="left", fill="x", expand=True, pady=10, padx=(0, 8))
+        self._entry.focus_set()
+
+        # Separator
+        tk.Frame(root, bg=C['border'], height=1).pack(fill="x")
+
+        # List
+        list_frame = tk.Frame(root, bg=C['bg'])
+        list_frame.pack(fill="both", expand=True, padx=0, pady=0)
+
+        scrollbar = tk.Scrollbar(list_frame, orient="vertical", bg=C['bg'],
+                                 troughcolor=C['bg'], width=6)
+        self._lb = tk.Listbox(list_frame, bg=C['bg'], fg=C['fg'],
+                              selectbackground=C['sel'], selectforeground=C['sel_fg'],
+                              font=FONT_MONO, relief="flat", bd=0,
+                              activestyle="none", highlightthickness=0,
+                              yscrollcommand=scrollbar.set)
+        scrollbar.config(command=self._lb.yview)
+        scrollbar.pack(side="right", fill="y")
+        self._lb.pack(fill="both", expand=True)
+
+        # Footer
+        tk.Frame(root, bg=C['border'], height=1).pack(fill="x")
+        self._footer = tk.Label(root, text="↑↓=move  Enter=select  Esc=close",
+                                bg=C['bg2'], fg=C['dim'],
+                                font=FONT_SMALL, anchor="w", padx=12, pady=6)
+        self._footer.pack(fill="x")
+
+        # Populate list
+        self._refresh_search()
+
+        # ── Bindings ──────────────────────────────────────────────────────────
+        self._var.trace_add("write", self._on_type)
+        # Bind Up/Down on entry to stop event reaching root (macOS fires both)
+        self._entry.bind("<Up>",   self._on_up)
+        self._entry.bind("<Down>", self._on_down)
+        self._lb.bind("<<ListboxSelect>>", self._on_lb_select)
+        root.bind("<Return>",        self._on_enter)
+        root.bind("<Escape>",        self._on_escape)
+        root.bind("<Command-r>",     self._on_refresh)
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Select first item
+        if self._lb.size() > 0:
+            self._lb.selection_set(0)
+            self._lb.activate(0)
+
+    # ── List management ───────────────────────────────────────────────────────
+
+    def _set_items(self, items):
+        self._lb.delete(0, "end")
+        for label, *_ in items:
+            self._lb.insert("end", label)
+        if items:
+            self._lb.selection_set(0)
+            self._lb.activate(0)
+
+    def _selected_idx(self):
+        sel = self._lb.curselection()
+        return sel[0] if sel else None
+
+    def _move(self, delta):
+        idx = self._selected_idx()
+        if idx is None:
+            idx = 0
+        else:
+            idx = max(0, min(self._lb.size() - 1, idx + delta))
+        self._lb.selection_clear(0, "end")
+        self._lb.selection_set(idx)
+        self._lb.activate(idx)
+        self._lb.see(idx)
+        if self.state == "hierarchy":
+            self._send_hover_at(idx)
+
+    # ── Search state ──────────────────────────────────────────────────────────
+
+    def _on_type(self, *_):
+        if self.state == "search":
+            self._refresh_search()
+        elif self.state == "actions":
+            self._refresh_actions()
+        elif self.state == "input":
+            pass  # raw text, no filtering
+        elif self.state == "viewer":
+            self._refresh_viewer()
+        elif self.state == "hierarchy":
+            self._filter_hierarchy(self._var.get())
+
+    def _refresh_search(self):
+        q = self._var.get().lower().strip()
+        # Check if it looks like a deeplink being typed
+        if _DEEPLINK_RE.match(self._var.get()):
+            self._shown = [("  Send deeplink: " + self._var.get(), "deeplink-new", self._var.get())]
+        elif q:
+            self._shown = [(l, t, v) for (l, t, v) in self._all_items if q in l.lower()]
+        else:
+            self._shown = list(self._all_items)
+        self._set_items(self._shown)
+        self._footer.config(
+            text=f"{len(self._shown)} results  |  ↑↓=move  Enter=select  Esc=close"
+        )
+
+    def _refresh_actions(self):
+        q = self._var.get().lower().strip()
+        if q:
+            self._shown = [(l, t, v) for (l, t, v) in self._action_items if q in l.lower()]
+        else:
+            self._shown = list(self._action_items)
+        self._set_items(self._shown)
+
+    # ── Events ────────────────────────────────────────────────────────────────
+
+    def _on_enter(self, _=None):
+        idx = self._selected_idx()
+        if idx is None:
+            return
+        if self.state == "search":
+            label, vtype, vvalue = self._shown[idx]
+            if vtype == "pkg":
+                self._enter_actions(vvalue)
+            elif vtype == "input-text":
+                self._enter_input()
+            elif vtype == "clipboard":
+                self._emit({"type": "clipboard", "value": vvalue})
+            elif vtype == "deeplink":
+                self._emit({"type": "deeplink", "value": vvalue})
+            elif vtype == "deeplink-new":
+                self._emit({"type": "deeplink", "value": vvalue})
+            elif vtype == "view-hierarchy":
+                self._enter_hierarchy_loading()
+            elif vtype == "dev-options":
+                self._enter_viewer("dev-options")
+            elif vtype == "install-apk":
+                self._pick_and_emit_apk()
+            else:
+                self._emit({"type": vtype})
+        elif self.state == "actions":
+            label, vtype, vvalue = self._shown[idx]
+            if vtype in ("launch", "force-stop", "clear-data", "uninstall"):
+                self._emit({"type": "app-action", "pkg": self.sel_pkg, "action": vtype})
+            elif vtype in ("shared-prefs", "remote-config", "litmus", "permissions"):
+                self._enter_viewer(vtype, pkg=self.sel_pkg)
+            else:
+                self._emit({"type": "app-action", "pkg": self.sel_pkg, "action": vtype})
+        elif self.state == "input":
+            text = self._var.get().strip()
+            if text:
+                self._emit({"type": "input-text", "text": text})
+        elif self.state == "hierarchy":
+            if idx is None or idx >= len(self._hier_shown):
+                return
+            node = self._hier_shown[idx]
+            children = node.get("children", [])
+            if children:
+                self._hier_nav_stack.append(
+                    (self._hier_current_nodes, self._hier_current_label)
+                )
+                rid = node.get("resource_id", "")
+                text = node.get("text", "")
+                cls = node.get("class_name", "")
+                self._hier_current_nodes = children
+                self._hier_current_label = rid or (f'"{text[:20]}"' if text else cls)
+                self._var.set("")
+                self._hier_show_level()
+            elif node.get("cx") or node.get("cy"):
+                # Fire tap without closing palette — send via stderr side-channel
+                msg = {"action": "tap", "cx": node["cx"], "cy": node["cy"]}
+                print(json.dumps(msg), file=sys.stderr, flush=True)
+
+    def _on_escape(self, _=None):
+        if self.state == "hierarchy":
+            if self._var.get():
+                self._var.set("")
+                self._hier_show_level()
+            elif self._hier_nav_stack:
+                self._hier_current_nodes, self._hier_current_label = \
+                    self._hier_nav_stack.pop()
+                self._hier_show_level()
+            else:
+                self._send_hover(None)
+                self._enter_search()
+        elif self.state in ("actions", "input", "viewer"):
+            self._enter_search()
+        else:
+            self._emit(None)
+
+    def _on_up(self, _=None):
+        self._move(-1)
+        return "break"
+
+    def _on_down(self, _=None):
+        self._move(1)
+        return "break"
+
+    def _on_refresh(self, _=None):
+        if self.state == "hierarchy":
+            self._enter_hierarchy_loading()
+        return "break"
+
+    def _on_close(self):
+        self._emit(None)
+
+    # ── State transitions ─────────────────────────────────────────────────────
+
+    def _enter_search(self):
+        self.state   = "search"
+        self.sel_pkg = None
+        self._var.set("")
+        self._prompt.config(text=">")
+        self._refresh_search()
+        self._footer.config(text="↑↓=move  Enter=select  Esc=close")
+
+    def _enter_actions(self, pkg):
+        self.state    = "actions"
+        self.sel_pkg  = pkg
+        self._var.set("")
+        short = pkg if len(pkg) <= 38 else "..." + pkg[-35:]
+        self._prompt.config(text=f"{short}  >")
+        self._action_items = [(l, t, None) for l, t in APP_ACTIONS]
+        self._shown = list(self._action_items)
+        self._set_items(self._shown)
+        self._footer.config(text="↑↓=move  Enter=execute  Esc=back")
+
+    def _enter_input(self):
+        self.state = "input"
+        self._var.set("")
+        self._prompt.config(text="text >")
+        self._lb.delete(0, "end")
+        self._lb.insert("end", "  (type text and press Enter to send to device)")
+        self._footer.config(text="Enter=send to device  Esc=back")
+
+    # ── Hierarchy state ───────────────────────────────────────────────────────
+
+    def _enter_hierarchy_loading(self):
+        self.state = "hierarchy"
+        self._hier_nav_stack = []
+        self._hier_current_nodes = []
+        self._hier_current_label = "root"
+        self._hier_all_flat = []
+        self._hier_shown = []
+        self._var.set("")
+        self._prompt.config(text="View Hierarchy  >")
+        self._lb.delete(0, "end")
+        self._lb.insert("end", "  loading...")
+        self._footer.config(text="fetching UI hierarchy from device...")
+        threading.Thread(target=self._bg_fetch_hierarchy, daemon=True).start()
+
+    def _bg_fetch_hierarchy(self):
+        try:
+            from inspectors.hierarchy import dump_hierarchy_tree
+            root_node, flat_nodes = dump_hierarchy_tree(self._serial)
+            self.root.after(0, lambda: self._show_hierarchy(root_node, flat_nodes))
+        except Exception as e:
+            self.root.after(0, lambda: self._footer.config(text=f"error: {e}"))
+
+    def _show_hierarchy(self, root_node, flat_nodes):
+        self._hier_all_flat = flat_nodes
+        children = root_node.get("children", [])
+        self._hier_current_nodes = children if children else [root_node]
+        self._hier_current_label = "root"
+        self._var.set("")
+        self._hier_show_level()
+
+    def _hier_node_label(self, node):
+        cls   = node.get("class_name", "?")
+        text  = node.get("text", "")
+        rid   = node.get("resource_id", "")
+        n_ch  = len(node.get("children", []))
+        label = f"  {cls}"
+        if text:
+            label += f'  "{text[:30]}"'
+        if rid:
+            label += f"  [{rid}]"
+        if n_ch:
+            label += f"  ({n_ch})"
+        elif node.get("clickable"):
+            label += "  ·tap"
+        return label
+
+    def _hier_show_level(self):
+        self._hier_shown = list(self._hier_current_nodes)
+        self._lb.delete(0, "end")
+        for n in self._hier_shown:
+            self._lb.insert("end", self._hier_node_label(n))
+        if self._hier_shown:
+            self._lb.selection_set(0)
+            self._lb.activate(0)
+            self._lb.see(0)
+            self._send_hover_at(0)
+        self._hier_update_footer()
+
+    def _hier_update_footer(self, searching=False):
+        path_parts = [lbl for _, lbl in self._hier_nav_stack] + [self._hier_current_label]
+        path = " > ".join(path_parts[-4:])
+        n    = len(self._hier_shown)
+        scope = " (search)" if searching else ""
+        self._footer.config(
+            text=f"{path}  |  {n} nodes{scope}  Enter=expand/tap  Esc=up"
+        )
+
+    def _filter_hierarchy(self, query):
+        ql = query.strip().lower()
+        if not ql:
+            self._hier_shown = list(self._hier_current_nodes)
+        else:
+            self._hier_shown = [
+                n for n in self._hier_all_flat
+                if ql in n.get("text", "").lower()
+                or ql in n.get("resource_id", "").lower()
+                or ql in n.get("class_name", "").lower()
+                or ql in n.get("content_desc", "").lower()
+            ]
+        self._lb.delete(0, "end")
+        for n in self._hier_shown:
+            self._lb.insert("end", self._hier_node_label(n))
+        if self._hier_shown:
+            self._lb.selection_set(0)
+            self._lb.activate(0)
+            self._lb.see(0)
+            self._send_hover_at(0)
+        else:
+            self._send_hover(None)
+        self._hier_update_footer(searching=bool(ql))
+
+    def _on_lb_select(self, _=None):
+        if self.state == "hierarchy":
+            idx = self._selected_idx()
+            if idx is not None:
+                self._send_hover_at(idx)
+
+    def _send_hover_at(self, idx):
+        if idx < len(self._hier_shown):
+            self._send_hover(self._hier_shown[idx].get("bounds"))
+        else:
+            self._send_hover(None)
+
+    def _send_hover(self, bounds):
+        msg = {"hover": list(bounds) if bounds else None}
+        print(json.dumps(msg), file=sys.stderr, flush=True)
+
+    def _pick_and_emit_apk(self):
+        path = filedialog.askopenfilename(
+            title="Select APK to install",
+            filetypes=[("APK files", "*.apk"), ("All files", "*.*")],
+        )
+        if path:
+            self._emit({"type": "install-apk", "path": path})
+        # else: user cancelled, stay open
+
+    def _enter_viewer(self, fetch_type, pkg=None):
+        short = pkg.split(".")[-1] if pkg else ""
+        display = {
+            "view-hierarchy": "View Hierarchy",
+            "shared-prefs":   f"Shared Prefs – {short}",
+            "remote-config":  f"Remote Config – {short}",
+            "litmus":         f"Litmus – {short}",
+            "permissions":    f"Permissions – {short}",
+            "dev-options":    "Dev Options",
+        }.get(fetch_type, fetch_type)
+        self.state = "viewer"
+        self._var.set("")
+        self._prompt.config(text=f"{display}  >")
+        self._lb.delete(0, "end")
+        self._lb.insert("end", "  Loading...")
+        self._footer.config(text="Loading...  Esc=back")
+        threading.Thread(
+            target=self._bg_fetch_viewer, args=(fetch_type, pkg), daemon=True
+        ).start()
+
+    def _bg_fetch_viewer(self, fetch_type, pkg=None):
+        try:
+            if fetch_type == "shared-prefs":
+                from inspectors import shared_prefs as _m
+                items = _m.fetch(pkg)
+                label = f"Shared Prefs – {pkg}"
+            elif fetch_type == "remote-config":
+                from inspectors import remote_config as _m
+                items = _m.fetch(pkg)
+                label = f"Remote Config – {pkg}"
+            elif fetch_type == "litmus":
+                from inspectors import litmus as _m
+                items, _ = _m.fetch(pkg)
+                label = f"Litmus – {pkg}"
+            elif fetch_type == "permissions":
+                from inspectors import permissions as _m
+                items = _m.fetch(pkg)
+                label = f"Permissions – {pkg}"
+            elif fetch_type == "dev-options":
+                from inspectors import dev_options as _m
+                items = _m.fetch(self._serial)
+                label = "Dev Options"
+            else:
+                items = [f"  (unsupported: {fetch_type})"]
+                label = fetch_type
+        except Exception as e:
+            items = [f"  error: {e}"]
+            label = fetch_type
+        self.root.after(0, lambda: self._show_viewer_items(label, items))
+
+    def _show_viewer_items(self, title, items):
+        self._viewer_all   = items
+        self._viewer_shown = items
+        self._prompt.config(text=f"{title}  >")
+        self._lb.delete(0, "end")
+        for line in items:
+            self._lb.insert("end", line)
+        self._footer.config(
+            text=f"{len(items)} items  |  ↑↓=move  Esc=back to search"
+        )
+
+    def _refresh_viewer(self):
+        q = self._var.get().lower()
+        self._viewer_shown = [l for l in self._viewer_all if not q or q in l.lower()]
+        self._lb.delete(0, "end")
+        for line in self._viewer_shown:
+            self._lb.insert("end", line)
+        self._footer.config(
+            text=f"{len(self._viewer_shown)} items  |  ↑↓=move  Esc=back to search"
+        )
+
+    # ── Emit ──────────────────────────────────────────────────────────────────
+
+    def _emit(self, result):
+        self.result = result
+        self.root.destroy()
+
+
+# ── Viewer window ─────────────────────────────────────────────────────────────
+
+class ViewerWindow:
+    W, H = 600, 500
+
+    def __init__(self, root, data):
+        self.root   = root
+        self.result = None
+        title = data.get("title", "Viewer")
+        items = data.get("items", [])   # [[key, val], ...] or [str, ...]
+
+        root.title(f"keytap – {title}")
+        root.geometry(f"{self.W}x{self.H}")
+        root.configure(bg=C['bg'])
+        root.resizable(True, True)
+        root.attributes("-topmost", True)
+
+        # Search bar
+        bar = tk.Frame(root, bg=C['bg2'])
+        bar.pack(fill="x")
+        tk.Label(bar, text=">", bg=C['bg2'], fg=C['accent'],
+                 font=FONT_MONO, padx=8, pady=8).pack(side="left")
+        self._var = tk.StringVar()
+        tk.Entry(bar, textvariable=self._var, bg=C['bg2'], fg=C['fg'],
+                 insertbackground=C['fg'], font=FONT_MONO,
+                 relief="flat", bd=0).pack(side="left", fill="x",
+                                           expand=True, pady=8, padx=(0,8))
+        tk.Frame(root, bg=C['border'], height=1).pack(fill="x")
+
+        # List (key – value)
+        lf = tk.Frame(root, bg=C['bg'])
+        lf.pack(fill="both", expand=True)
+        sb = tk.Scrollbar(lf, orient="vertical", bg=C['bg'], width=6)
+        self._lb = tk.Listbox(lf, bg=C['bg'], fg=C['fg'],
+                              selectbackground=C['sel'], selectforeground=C['sel_fg'],
+                              font=FONT_SMALL, relief="flat", bd=0,
+                              activestyle="none", highlightthickness=0,
+                              yscrollcommand=sb.set)
+        sb.config(command=self._lb.yview)
+        sb.pack(side="right", fill="y")
+        self._lb.pack(fill="both", expand=True)
+
+        tk.Frame(root, bg=C['border'], height=1).pack(fill="x")
+        tk.Label(root, text=f"{title}  |  Esc=close",
+                 bg=C['bg2'], fg=C['dim'],
+                 font=FONT_SMALL, anchor="w", padx=12, pady=6).pack(fill="x")
+
+        # Normalise items
+        self._all = []
+        for it in items:
+            if isinstance(it, (list, tuple)) and len(it) == 2:
+                k, v = str(it[0]), str(it[1])
+                self._all.append(f"  {k}  =  {v}")
+            else:
+                self._all.append(f"  {it}")
+
+        self._refresh()
+        self._var.trace_add("write", lambda *_: self._refresh())
+
+        root.bind("<Escape>", lambda _: self._close())
+        root.protocol("WM_DELETE_WINDOW", self._close)
+
+    def _refresh(self):
+        q = self._var.get().lower()
+        self._lb.delete(0, "end")
+        for line in self._all:
+            if not q or q in line.lower():
+                self._lb.insert("end", line)
+
+    def _close(self):
+        self.root.destroy()
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    raw = sys.stdin.readline()
+    if not raw.strip():
+        print("null")
+        return
+
+    data = json.loads(raw)
+    mode = data.get("mode", "palette")
+
+    root = tk.Tk()
+
+    if mode == "viewer":
+        w = ViewerWindow(root, data)
+        root.mainloop()
+        # viewer doesn't return an action
+        print("null")
+    else:
+        w = PaletteWindow(root, data)
+        root.mainloop()
+        print(json.dumps(w.result))
+
+    sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()
