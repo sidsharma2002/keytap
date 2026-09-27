@@ -162,6 +162,12 @@ class CommandPalette:
                 self._virtual.append(("  Theme — switch color theme", "theme-switcher", ""))
             if not ql or ql in "developer options":
                 self._virtual.append(("  Developer Options — toggle ADB debug settings", "dev-options", ""))
+            if ql and ql in "wifi":
+                self._virtual.append(("  WiFi — toggle", "quick-toggle", "wifi"))
+            if ql and ql in "dark mode":
+                self._virtual.append(("  Dark Mode — toggle", "quick-toggle", "dark_mode"))
+            if ql and ql in "mobile data":
+                self._virtual.append(("  Mobile Data — toggle", "quick-toggle", "mobile_data"))
             if ql and ql in "clipboard":
                 preview = (self._clipboard_text[:60].replace('\n', ' ')
                            if self._clipboard_text else "(empty)")
@@ -256,6 +262,9 @@ class CommandPalette:
                 elif vtype == "dev-options":
                     self._enter_loading("Dev Options")
                     self._on_action("__dev-options__", "")
+                elif vtype == "quick-toggle":
+                    self._on_action("__quick-toggle__", vvalue)
+                    self._close()
                 else:
                     self._on_action(f"__{vtype}__", vvalue)
                     self._close()

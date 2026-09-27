@@ -444,6 +444,9 @@ class KeyTap:
         if pkg == "__dev-options__":
             threading.Thread(target=self._fetch_dev_options, daemon=True).start()
             return
+        if pkg == "__quick-toggle__":
+            threading.Thread(target=lambda k=action: self._do_quick_toggle(k), daemon=True).start()
+            return
         if pkg == "__view-hierarchy__":
             threading.Thread(target=self._fetch_hierarchy, daemon=True).start()
             return
@@ -506,6 +509,17 @@ class KeyTap:
             threading.Thread(target=lambda p=pkg: self._fetch_permissions(p), daemon=True).start()
 
     # ── Inspector fetchers (delegate to inspectors package) ───────────────────
+
+    _QUICK_TOGGLE_LABELS = {
+        "wifi":        "WiFi",
+        "dark_mode":   "Dark Mode",
+        "mobile_data": "Mobile Data",
+    }
+
+    def _do_quick_toggle(self, key):
+        label = self._QUICK_TOGGLE_LABELS.get(key, key)
+        new_state = dev_options.toggle_by_label(label, ARGS.serial)
+        self.root.after(0, lambda: self.status(f"{label}: {new_state}"))
 
     def _fetch_dev_options(self):
         items = dev_options.fetch(ARGS.serial)
