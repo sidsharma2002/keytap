@@ -1,4 +1,9 @@
+import logging
+import time as _time
+
 from utils import adb_shell
+
+_log = logging.getLogger("keytap.dev_options")
 
 # type="toggle"  — binary ON/OFF via settings put
 # type="setprop" — binary ON/OFF via setprop (needs app restart, label ends with *)
@@ -170,11 +175,11 @@ _BY_LABEL = {o["label"]: o for o in _OPTIONS}
 
 
 def _is_enabled(opt, serial):
+    """Read a single option state. Used by toggle_by_label (not by fetch)."""
     t = opt.get("type", "toggle")
     if t == "setprop":
         raw = adb_shell(f"getprop {opt['prop']}", serial).strip()
         return raw == opt["on_val"]
-    # toggle (settings-based)
     raw = adb_shell(f"settings get {opt['read_ns']} {opt['read_key']}", serial).strip()
     if raw in ("", "null"):
         return opt.get("default_on", False)
@@ -186,19 +191,56 @@ def _is_enabled(opt, serial):
     return raw == opt.get("on_val", "1")
 
 
+def _parse_raw(opt, raw):
+    """Derive state string from a raw adb output line for one option."""
+    raw = raw.strip()
+    t = opt.get("type", "toggle")
+    if t == "cycle":
+        if raw in ("", "null"):
+            raw = opt["default_val"]
+        return f"{raw}x"
+    if t == "setprop":
+        return "ON" if raw == opt["on_val"] else "OFF"
+    # toggle
+    if raw in ("", "null"):
+        enabled = opt.get("default_on", False)
+    elif opt["id"] == "animations":
+        try:
+            enabled = float(raw) != 0.0
+        except ValueError:
+            enabled = opt.get("default_on", False)
+    else:
+        enabled = raw == opt.get("on_val", "1")
+    return "ON" if enabled else "OFF"
+
+
 def fetch(serial=None):
-    """Return [(label, state_str)] for all options."""
-    items = []
+    """Return [(label, state_str)] for all options.
+
+    Batches all reads into a single adb shell call (semicolon-separated)
+    instead of spawning one subprocess per option.
+    """
+    _t0 = _time.time()
+    _log.debug("fetch start (batched), %d options", len(_OPTIONS))
+
+    cmds = []
     for opt in _OPTIONS:
         t = opt.get("type", "toggle")
-        if t == "cycle":
-            raw = adb_shell(f"settings get {opt['read_ns']} {opt['read_key']}", serial).strip()
-            if raw in ("", "null"):
-                raw = opt["default_val"]
-            state = f"{raw}x"
+        if t == "setprop":
+            cmds.append(f"getprop {opt['prop']}")
         else:
-            state = "ON" if _is_enabled(opt, serial) else "OFF"
-        items.append((opt["label"], state))
+            cmds.append(f"settings get {opt['read_ns']} {opt['read_key']}")
+
+    raw_output = adb_shell("; ".join(cmds), serial)
+    lines = raw_output.splitlines()
+    # Pad if device output is unexpectedly short
+    while len(lines) < len(_OPTIONS):
+        lines.append("")
+
+    items = [(opt["label"], _parse_raw(opt, raw))
+             for opt, raw in zip(_OPTIONS, lines)]
+
+    _log.debug("fetch done in %.2fs", _time.time() - _t0)
     return items
 
 

@@ -1,5 +1,9 @@
+import logging
 import subprocess
+import time as _time
 import xml.etree.ElementTree as ET
+
+_log = logging.getLogger("keytap.hierarchy")
 
 try:
     import uiautomator2 as u2
@@ -43,20 +47,32 @@ def _collect_flat(node, out):
         _collect_flat(child, out)
 
 
-def dump_hierarchy_tree(serial=None):
+def dump_hierarchy_tree(serial=None, u2_dev=None):
     """Return (root_dict, flat_node_list). Uses u2 if available, else adb uiautomator dump."""
+    _t0 = _time.time()
+    _log.debug("dump start HAS_U2=%s serial=%r preconnected=%s", HAS_U2, serial, u2_dev is not None)
     if HAS_U2:
-        d = u2.connect(serial) if serial else u2.connect()
-        xml_raw = d.dump_hierarchy()
+        if u2_dev is None:
+            _log.debug("u2.connect() ...")
+            u2_dev = u2.connect(serial) if serial else u2.connect()
+            _log.debug("u2.connect() done in %.2fs", _time.time() - _t0)
+        else:
+            _log.debug("using pre-connected u2 device")
+        _t1 = _time.time()
+        xml_raw = u2_dev.dump_hierarchy()
+        _log.debug("dump_hierarchy() done in %.2fs (total %.2fs)", _time.time() - _t1, _time.time() - _t0)
         xml_str = xml_raw if isinstance(xml_raw, str) else xml_raw.decode()
     else:
         cmd = ['adb']
         if serial:
             cmd += ['-s', serial]
         cmd += ['shell', 'uiautomator', 'dump', '/dev/stdout']
+        _log.debug("adb uiautomator dump ...")
         result = subprocess.run(cmd, capture_output=True, timeout=15)
+        _log.debug("adb dump done in %.2fs stdout_len=%d", _time.time() - _t0, len(result.stdout))
         xml_str = result.stdout.decode(errors='replace').strip()
 
+    _tp = _time.time()
     root_el = ET.fromstring(xml_str)
     if root_el.tag == 'hierarchy':
         children = list(root_el)
@@ -74,4 +90,5 @@ def dump_hierarchy_tree(serial=None):
 
     flat = []
     _collect_flat(root_node, flat)
+    _log.debug("parse+flatten done in %.2fs, %d nodes (total %.2fs)", _time.time() - _tp, len(flat), _time.time() - _t0)
     return root_node, flat

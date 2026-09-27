@@ -2,38 +2,50 @@ import argparse
 import os
 import shutil
 
+from settings import section as _s
+
 
 def _find_adb():
-    # 1. system PATH
     found = shutil.which("adb")
     if found:
         return found
-    # 2. common macOS install location
     candidate = os.path.expanduser("~/Library/Android/sdk/platform-tools/adb")
     if os.path.isfile(candidate):
         return candidate
-    # 3. common Linux install location
     candidate = os.path.expanduser("~/Android/Sdk/platform-tools/adb")
     if os.path.isfile(candidate):
         return candidate
-    return "adb"  # last resort: hope it's on PATH
+    return "adb"
 
 
-ADB_PATH    = _find_adb()
-CURSOR_MODE = True   # True = arrow-key cursor; False = 2-letter label typing
-CURSOR_JUMP = 5      # Shift+arrow jumps this many cells at once
-FIFO_PATH   = "/tmp/keytap_stream.fifo"
-HAS_SCRCPY  = shutil.which("scrcpy") is not None
-HAS_FFMPEG  = shutil.which("ffmpeg") is not None
+ADB_PATH  = _find_adb()
+HAS_FFMPEG = shutil.which("ffmpeg") is not None
+
+# Display defaults come from settings.json, can still be overridden by CLI args
+_disp = _s("display")
+CURSOR_MODE = _disp.get("cursor_mode", True)
+CURSOR_JUMP = _disp.get("cursor_jump", 5)
 
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--serial", default=None, help="ADB serial (e.g. emulator-5554)")
-    p.add_argument("--cols",   type=int, default=10)
-    p.add_argument("--rows",   type=int, default=32)
-    p.add_argument("--height", type=int, default=800, help="mirror window height px")
-    return p.parse_args()
+    p.add_argument("--serial", default=None,  help="ADB serial (e.g. emulator-5554)")
+    p.add_argument("--cols",   type=int,      default=_disp.get("cols", 10))
+    p.add_argument("--rows",   type=int,      default=_disp.get("rows", 32))
+    p.add_argument("--height", type=int,      default=_disp.get("height", 800),
+                   help="mirror window height px")
+    args, _ = p.parse_known_args()
+    return args
 
 
-ARGS = parse_args()
+_ARGS = None
+
+
+def __getattr__(name):
+    """Lazy ARGS: argparse only runs when ARGS is first accessed, not on import."""
+    global _ARGS
+    if name == 'ARGS':
+        if _ARGS is None:
+            _ARGS = parse_args()
+        return _ARGS
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

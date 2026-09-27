@@ -1,394 +1,527 @@
-import sys
-import os
 import json
+import os
+import queue
 import string
 import subprocess
-import tkinter as tk
-from PIL import ImageTk, ImageChops
+import sys
 import threading
 import time
 
-from config import ARGS, CURSOR_MODE, CURSOR_JUMP
-from adb import adb, get_device_size
+import pygame
+
+import actions
+import fonts
+from adb import adb, get_device_size, list_devices
 from capture import CaptureManager
+from config import ARGS, CURSOR_MODE, CURSOR_JUMP, ADB_PATH
+from element_manager import ElementManager
 from grid import GridRenderer
-from palette import CommandPalette
-from elements import LABEL_CHARS
-from inspectors import shared_prefs, remote_config, litmus, permissions, dev_options
-from inspectors.hierarchy import dump_hierarchy_tree
+from settings import kb
+
+STATUS_H = 24   # height of status bar below the mirror
+_PROC    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "palette_proc.py")
 
 
 class KeyTap:
     def __init__(self, dev_w, dev_h):
-        self.dev_w = dev_w
-        self.dev_h = dev_h
+        self.dev_w  = dev_w
+        self.dev_h  = dev_h
         self.scale  = ARGS.height / dev_h
         self.win_w  = int(dev_w * self.scale)
         self.win_h  = ARGS.height
 
-        self.input_buf        = []
-        self.cursor_row       = 0
-        self.cursor_col       = 0
-        self.photo            = None
-        self._raw_frame       = None
-        self._last_scroll_t   = 0.0
-        self._last_shift_t    = 0.0
-        self._packages        = []
-        self._packages_ready  = False
-        self._palette         = None
-        self._deeplink_history = []
-        self._elements        = []
-        self._element_mode    = False
-        self._element_loading = False
-        self._element_buf     = []
-        self._elem_ref_frame   = None
-        self._elem_last_dump_t = 0.0
-        self._elem_show_bounds = False
-        self._hier_highlight   = None   # (wx1, wy1, wx2, wy2) or None
+        # ── Pygame window ─────────────────────────────────────────────────────
+        pygame.init()
+        self.screen = pygame.display.set_mode((self.win_w, self.win_h + STATUS_H))
+        pygame.display.set_caption("keytap")
 
-        self._build_ui()
+        # ── Components ────────────────────────────────────────────────────────
+        self.capture  = CaptureManager(self.win_w, self.win_h, dev_w, dev_h,
+                                       on_status=self._set_status)
+        self.renderer = GridRenderer(self.win_w, self.win_h)
+        self.renderer.init_fonts()
 
-        self._capture  = CaptureManager(
-            self.win_w, self.win_h,
-            on_status=lambda msg: self.root.after(0, lambda m=msg: self.status(m))
+        self.elements = ElementManager(
+            serial=ARGS.serial,
+            scale=self.scale,
+            on_status=self._set_status,
+            on_tap=self._on_elem_tap,
         )
-        self._renderer = GridRenderer(self.win_w, self.win_h)
+        self.clock = pygame.time.Clock()
 
-    # ── UI setup ─────────────────────────────────────────────────────────────
+        # ── App state ─────────────────────────────────────────────────────────
+        self.cursor_row        = 0
+        self.cursor_col        = 0
+        self.input_buf         = []
+        self._status           = "connecting..."
+        self._raw_surf         = None    # latest pygame Surface from capture
+        self._hier_highlight   = None    # (wx1, wy1, wx2, wy2)
+        self._last_shift_t     = 0.0
+        self._palette_result_q = queue.Queue()
+        self._palette_proc     = None   # pre-warmed palette subprocess
+        self._palette_ready    = False  # True once subprocess signals __ready__
 
-    def _build_ui(self):
-        self.root = tk.Tk()
-        self.root.title("keytap")
-        self.root.resizable(False, False)
-        self.root.configure(bg="#111")
+        # Package list (for palette)
+        self._packages         = []
+        self._packages_ready   = False
 
-        self.canvas = tk.Canvas(
-            self.root, width=self.win_w, height=self.win_h,
-            bg="black", highlightthickness=0, cursor="none"
-        )
-        self.canvas.pack()
-        self._img_id = self.canvas.create_image(0, 0, anchor="nw")
+        # Deeplink history
+        self._deeplinks        = []
 
-        self.status_var = tk.StringVar(value="connecting...")
-        status_frame = tk.Frame(self.root, bg="#1a1a1a", width=self.win_w, height=22)
-        status_frame.pack(fill="x")
-        status_frame.pack_propagate(False)
-        tk.Label(
-            status_frame, textvariable=self.status_var,
-            bg="#1a1a1a", fg="#888", font=("Menlo", 11), anchor="w", padx=8
-        ).pack(fill="both", expand=True)
+        # Stats overlay
+        self._stats_visible    = False
+        self._consumer_fps     = 0.0
+        self._consumer_frames  = 0
+        self._consumer_t       = 0.0
+        self._render_ms        = 0.0
 
-        self.root.bind("<KeyPress>", self.on_key)
-        self.root.focus_force()
+        # Status font
+        self._status_font = self._try_font(11)
 
-    # ── Coordinate helpers ────────────────────────────────────────────────────
+    # ── Font helper ───────────────────────────────────────────────────────────
 
-    def cell_to_dev(self, label):
-        r = string.ascii_uppercase.index(label[0].upper())
-        c = string.ascii_uppercase.index(label[1].upper())
-        if r >= ARGS.rows or c >= ARGS.cols:
-            raise ValueError("out of range")
-        return self.cell_to_dev_rc(r, c)
-
-    def cell_to_dev_rc(self, r, c):
-        cw = self.dev_w / ARGS.cols
-        ch = self.dev_h / ARGS.rows
-        return int(c * cw + cw / 2), int(r * ch + ch / 2)
-
-    # ── Display ───────────────────────────────────────────────────────────────
-
-    def _push_frame(self, frame):
-        win_elements = None
-        if self._element_mode and self._elements:
-            s = self.scale
-            buf = self._element_buf
-            win_elements = []
-            for el in self._elements:
-                if not buf:
-                    display_label, active = el['label'], True
-                elif el['label'][0] == buf[0]:
-                    display_label, active = el['label'], True
-                else:
-                    display_label, active = el['label'], False
-                win_elements.append({
-                    **el,
-                    'wx1': int(el['x1'] * s), 'wy1': int(el['y1'] * s),
-                    'wx2': int(el['x2'] * s), 'wy2': int(el['y2'] * s),
-                    'display_label': display_label,
-                    'active': active,
-                    'show_bounds': self._elem_show_bounds,
-                })
-        composited = self._renderer.composite(
-            frame, self.cursor_row, self.cursor_col, self.input_buf, win_elements,
-            highlight_bounds=self._hier_highlight
-        )
-        self.photo = ImageTk.PhotoImage(composited)
-        self.canvas.itemconfig(self._img_id, image=self.photo)
-
-    def redraw(self):
-        if self._raw_frame is not None:
-            self._push_frame(self._raw_frame)
-
-    def _display_loop(self):
-        try:
-            frame = self._capture.frame_q.get_nowait()
-            self._raw_frame = frame
-            self._push_frame(frame)
-            self._idle_status()
-            if self._element_mode and not self._element_loading:
-                self._check_screen_change(frame)
-        except Exception:
-            pass
-        self.root.after(16, self._display_loop)
+    def _try_font(self, size):
+        return fonts.load(size)
 
     # ── Status ────────────────────────────────────────────────────────────────
 
-    def status(self, msg):
-        self.status_var.set(msg)
+    def _set_status(self, msg):
+        self._status = msg
 
     def _idle_status(self):
-        if self._element_mode:
-            n = len(self._elements)
-            bounds_hint = "Tab=show bounds" if not self._elem_show_bounds else "Tab=hide bounds"
-            self.status(
-                f"element mode: {n} elements  |  type 2-char label to tap  {bounds_hint}  e=exit"
-            )
+        if self.elements.active:
+            self.elements.idle_status()
             return
         if CURSOR_MODE:
             r, c = self.cursor_row, self.cursor_col
-            row_label = string.ascii_uppercase[r] if r < 26 else str(r + 1)
-            col_label = string.ascii_uppercase[c]
-            self.status(
-                f"cursor: {row_label}{col_label} (row {r+1}, col {c+1})"
-                f"  |  arrows=move  Shift=jump5  space=tap"
+            rl = string.ascii_uppercase[r] if r < 26 else str(r + 1)
+            cl = string.ascii_uppercase[c]
+            self._set_status(
+                f"cursor: {rl}{cl} (row {r+1}, col {c+1})"
+                f"  |  arrows=move  Shift=jump{CURSOR_JUMP}  space=tap"
                 f"  w/s=scroll  b=back  h=home  r=recents  Esc=quit"
             )
         else:
             buf = ''.join(self.input_buf).upper()
-            cols_range = string.ascii_uppercase[:ARGS.cols]
-            rows_range = string.ascii_uppercase[:min(ARGS.rows, 26)]
+            cols_r = string.ascii_uppercase[:ARGS.cols]
+            rows_r = string.ascii_uppercase[:min(ARGS.rows, 26)]
             if len(buf) == 1:
-                self.status(f"row {buf} selected  ->  type col ({cols_range[0]}-{cols_range[-1]})  |  Backspace=cancel")
+                self._set_status(
+                    f"row {buf} selected  ->  type col ({cols_r[0]}-{cols_r[-1]})"
+                    f"  |  Backspace=cancel")
             else:
-                self.status(f"type row ({rows_range[0]}-{rows_range[-1]}) then col ({cols_range[0]}-{cols_range[-1]})  |  Esc=quit")
+                self._set_status(
+                    f"type row ({rows_r[0]}-{rows_r[-1]})"
+                    f" then col ({cols_r[0]}-{cols_r[-1]})  |  Esc=quit")
 
-    # ── ADB actions ──────────────────────────────────────────────────────────
+    # ── Coordinate helpers ────────────────────────────────────────────────────
 
-    def _run_adb(self, *cmd):
-        threading.Thread(target=lambda: adb(*cmd), daemon=True).start()
+    def _cell_to_dev_rc(self, r, c):
+        cw = self.dev_w / ARGS.cols
+        ch = self.dev_h / ARGS.rows
+        return int(c * cw + cw / 2), int(r * ch + ch / 2)
 
-    def do_tap(self, dx, dy):
-        self.status(f"tap ({dx},{dy})")
-        self._run_adb("shell", "input", "tap", str(dx), str(dy))
+    def _label_to_dev(self, label):
+        r = string.ascii_uppercase.index(label[0].upper())
+        c = string.ascii_uppercase.index(label[1].upper())
+        if r >= ARGS.rows or c >= ARGS.cols:
+            raise ValueError("out of range")
+        return self._cell_to_dev_rc(r, c)
 
-    def do_keyevent(self, code, label):
-        self.status(f"keyevent: {label}")
-        self._run_adb("shell", "input", "keyevent", str(code))
+    # ── ADB actions ───────────────────────────────────────────────────────────
 
-    def do_swipe(self, x1, y1, x2, y2, duration=300, label="swipe"):
-        self.status(f"{label} ({x1},{y1})->({x2},{y2})")
-        self._run_adb("shell", "input", "swipe",
-                      str(x1), str(y1), str(x2), str(y2), str(duration))
+    def _tap(self, dx, dy):
+        actions.tap(dx, dy, on_status=self._set_status)
 
-    # ── Key handler ──────────────────────────────────────────────────────────
+    def _keyevent(self, code, label=""):
+        actions.keyevent(code, label, on_status=self._set_status)
 
-    def _do_scroll(self, char):
-        now = time.time()
-        if now - self._last_scroll_t < 0.4:
-            return
-        self._last_scroll_t = now
-        cx, cy = self.cell_to_dev_rc(self.cursor_row, self.cursor_col)
-        dist = int(self.dev_h * 0.4)
-        if char == 'W':
-            self.do_swipe(cx, max(cy - dist // 2, 0),
-                          cx, min(cy + dist // 2, self.dev_h - 1), label="scroll up")
-        else:
-            self.do_swipe(cx, min(cy + dist // 2, self.dev_h - 1),
-                          cx, max(cy - dist // 2, 0), label="scroll down")
+    def _scroll(self, direction):
+        cx, cy = self._cell_to_dev_rc(self.cursor_row, self.cursor_col)
+        actions.scroll(cx, cy, self.dev_h, direction, on_status=self._set_status)
 
-    def _handle_cursor_key(self, event):
-        sym  = event.keysym
-        char = event.char.upper() if event.char else ""
-        step = CURSOR_JUMP if bool(event.state & 0x1) else 1
+    def _on_elem_tap(self, cx, cy, hint):
+        self._set_status(f"tap '{hint}' ({cx},{cy})")
+        actions.tap(cx, cy)
 
-        # E: toggle element overlay (takes priority always)
-        if char == 'E':
-            self._exit_element_mode() if self._element_mode else self._enter_element_mode()
-            return
+    # ── Key handling ──────────────────────────────────────────────────────────
 
-        # Element mode: 2-char label selection; system shortcuts still work
-        if self._element_mode:
-            moved = False
-            if sym == 'Tab':
-                self._elem_show_bounds = not self._elem_show_bounds
-                self.redraw()
-            elif sym == 'BackSpace':
-                if self._element_buf:
-                    self._element_buf.clear()
-                    self.redraw()
-                    self._idle_status()
-            elif sym == 'Up':      self.cursor_row = max(0, self.cursor_row - step); moved = True
-            elif sym == 'Down':    self.cursor_row = min(ARGS.rows - 1, self.cursor_row + step); moved = True
-            elif sym == 'Left':    self.cursor_col = max(0, self.cursor_col - step); moved = True
-            elif sym == 'Right':   self.cursor_col = min(ARGS.cols - 1, self.cursor_col + step); moved = True
-            elif sym == 'space':
-                dx, dy = self.cell_to_dev_rc(self.cursor_row, self.cursor_col)
-                self.do_tap(dx, dy)
-            elif char == 'B': self.do_keyevent(4, "back")
-            elif char == 'H': self.do_keyevent(3, "home")
-            elif char == 'R': self.do_keyevent(187, "recents")
-            elif char in ('W', 'S'): self._do_scroll(char)
-            elif char and char.lower() in LABEL_CHARS:
-                self._handle_element_input(char.lower())
-            if moved:
-                self.redraw()
-                self._idle_status()
-            return
+    def _handle_key(self, event):
+        """Returns False to quit, True to continue."""
+        sym  = event.key
+        char = event.unicode.upper() if event.unicode else ""
+        cl   = char.lower()
+        mods = pygame.key.get_mods()
+        step = CURSOR_JUMP if (mods & pygame.KMOD_SHIFT) else 1
 
-        if sym == 'Up':
-            self.cursor_row = max(0, self.cursor_row - step)
-        elif sym == 'Down':
-            self.cursor_row = min(ARGS.rows - 1, self.cursor_row + step)
-        elif sym == 'Left':
-            self.cursor_col = max(0, self.cursor_col - step)
-        elif sym == 'Right':
-            self.cursor_col = min(ARGS.cols - 1, self.cursor_col + step)
-        elif sym == 'space':
-            dx, dy = self.cell_to_dev_rc(self.cursor_row, self.cursor_col)
-            self.do_tap(dx, dy)
-            return
-        elif char == 'B':
-            self.do_keyevent(4, "back"); return
-        elif char == 'H':
-            self.do_keyevent(3, "home"); return
-        elif char == 'R':
-            self.do_keyevent(187, "recents"); return
-        elif char in ('W', 'S'):
-            self._do_scroll(char); return
-        else:
-            return
-        self.redraw()
-        self._idle_status()
+        # Quit
+        if sym == pygame.K_ESCAPE:
+            return False
 
-    def _handle_label_key(self, sym, char):
-        if sym == 'BackSpace':
-            if self.input_buf:
-                self.input_buf.pop()
-                self.redraw()
-                self._idle_status()
-            return
-        if not char.isalpha():
-            return
-        self.input_buf.append(char)
-        if len(self.input_buf) == 1:
-            self.redraw()
-            self._idle_status()
-            return
-        label = ''.join(self.input_buf)
-        self.input_buf.clear()
-        try:
-            dx, dy = self.cell_to_dev(label)
-            self.do_tap(dx, dy)
-        except ValueError:
-            self.status(f"'{label}' out of range")
-        self.redraw()
-
-    def on_key(self, event):
-        sym = event.keysym
-
-        if sym == 'Escape':
-            self.root.destroy()
-            return
-
-        if sym in ('Shift_L', 'Shift_R'):
+        # Double-shift → palette
+        if sym in (pygame.K_LSHIFT, pygame.K_RSHIFT):
             now = time.time()
             if now - self._last_shift_t < 0.4:
                 self._open_palette()
                 self._last_shift_t = 0.0
             else:
                 self._last_shift_t = now
-            return
+            return True
+
+        # Element mode toggle (priority)
+        if cl == kb.element_mode:
+            if self.elements.active:
+                self.elements.exit()
+            else:
+                self.elements.enter(ref_surf=self._raw_surf)
+            self._idle_status()
+            return True
 
         if CURSOR_MODE:
-            self._handle_cursor_key(event)
+            self._handle_cursor(sym, char, cl, step)
         else:
-            self._handle_label_key(sym, event.char.upper() if event.char else "")
+            self._handle_label(sym, char, cl)
 
-    # ── Element overlay ──────────────────────────────────────────────────────
+        return True
 
-    def _enter_element_mode(self):
-        if self._element_loading:
-            return
-        self._element_loading = True
-        if not self._element_mode:
-            self.status("dumping UI hierarchy...")
-        threading.Thread(target=self._fetch_elements, daemon=True).start()
-
-    def _fetch_elements(self):
-        try:
-            from elements import dump_elements
-            els = dump_elements(ARGS.serial)
-            self.root.after(0, lambda e=els: self._on_elements_loaded(e))
-        except Exception as ex:
-            self.root.after(0, lambda m=str(ex): self._on_element_error(m))
-
-    def _on_elements_loaded(self, elements):
-        self._element_loading = False
-        self._elements = elements
-        self._element_mode = True
-        self._elem_ref_frame = self._raw_frame
-        self._elem_last_dump_t = time.time()
-        self._element_buf.clear()
-        self.redraw()
-        self._idle_status()
-
-    def _check_screen_change(self, frame):
-        if self._elem_ref_frame is None:
-            return
-        if time.time() - self._elem_last_dump_t < 0.5:
-            return
-        small = frame.resize((90, 200))
-        ref   = self._elem_ref_frame.resize((90, 200))
-        diff  = ImageChops.difference(small, ref)
-        bbox  = diff.getbbox()
-        if bbox and (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]) > 90 * 200 * 0.08:
-            self._enter_element_mode()
-
-    def _on_element_error(self, msg):
-        self._element_loading = False
-        self.status(f"element dump failed: {msg}")
-
-    def _exit_element_mode(self):
-        self._elements = []
-        self._element_buf.clear()
-        self._element_mode = False
-        self._elem_show_bounds = False
-        self.redraw()
-        self._idle_status()
-
-    def _handle_element_input(self, char):
-        self._element_buf.append(char)
-        if len(self._element_buf) == 1:
-            matches = [el for el in self._elements if el['label'][0] == char]
-            if not matches:
-                self.status(f"no element '{char}...'")
-                self._element_buf.clear()
-                return
-            self.redraw()
-            self.status(f"'{char}...' - press second key  |  Backspace=cancel")
-        elif len(self._element_buf) == 2:
-            label = ''.join(self._element_buf)
-            self._element_buf.clear()
-            el = next((e for e in self._elements if e['label'] == label), None)
-            if el:
-                hint = el['text'] or el['resource_id'] or label
-                self.do_tap(el['cx'], el['cy'])
-                self.status(f"tap '{hint}' ({el['cx']},{el['cy']})")
+    def _handle_cursor(self, sym, char, cl, step):
+        """Arrow-key cursor mode."""
+        if self.elements.active:
+            if sym == pygame.K_TAB:
+                self.elements.toggle_bounds()
+            elif sym == pygame.K_BACKSPACE:
+                self.elements.clear_buf()
+            elif sym == pygame.K_UP:
+                self.cursor_row = max(0, self.cursor_row - step)
+            elif sym == pygame.K_DOWN:
+                self.cursor_row = min(ARGS.rows - 1, self.cursor_row + step)
+            elif sym == pygame.K_LEFT:
+                self.cursor_col = max(0, self.cursor_col - step)
+            elif sym == pygame.K_RIGHT:
+                self.cursor_col = min(ARGS.cols - 1, self.cursor_col + step)
+            elif sym == pygame.K_SPACE:
+                dx, dy = self._cell_to_dev_rc(self.cursor_row, self.cursor_col)
+                self._tap(dx, dy)
+            elif cl == kb.back:
+                self._keyevent(4, "back")
+            elif cl == kb.home:
+                self._keyevent(3, "home")
+            elif cl == kb.recents:
+                self._keyevent(187, "recents")
+            elif cl == kb.scroll_up:
+                self._scroll('up')
+            elif cl == kb.scroll_down:
+                self._scroll('down')
             else:
-                self.status(f"no element '{label}'")
-            self.redraw()
+                self.elements.handle_char(cl)
+            self._idle_status()
+            return
 
-    # ── Command palette ──────────────────────────────────────────────────────
+        if sym == pygame.K_UP:
+            self.cursor_row = max(0, self.cursor_row - step)
+        elif sym == pygame.K_DOWN:
+            self.cursor_row = min(ARGS.rows - 1, self.cursor_row + step)
+        elif sym == pygame.K_LEFT:
+            self.cursor_col = max(0, self.cursor_col - step)
+        elif sym == pygame.K_RIGHT:
+            self.cursor_col = min(ARGS.cols - 1, self.cursor_col + step)
+        elif sym == pygame.K_SPACE:
+            dx, dy = self._cell_to_dev_rc(self.cursor_row, self.cursor_col)
+            self._tap(dx, dy)
+            return
+        elif cl == kb.back:
+            self._keyevent(4, "back"); return
+        elif cl == kb.home:
+            self._keyevent(3, "home"); return
+        elif cl == kb.recents:
+            self._keyevent(187, "recents"); return
+        elif cl == kb.scroll_up:
+            self._scroll('up'); return
+        elif cl == kb.scroll_down:
+            self._scroll('down'); return
+        else:
+            return
+        self._idle_status()
+
+    def _handle_label(self, sym, char, cl):
+        """2-letter label typing mode."""
+        if sym == pygame.K_BACKSPACE:
+            if self.input_buf:
+                self.input_buf.pop()
+                self._idle_status()
+            return
+        if not char.isalpha():
+            return
+        self.input_buf.append(char)
+        if len(self.input_buf) == 1:
+            self._idle_status()
+            return
+        label = ''.join(self.input_buf)
+        self.input_buf.clear()
+        try:
+            dx, dy = self._label_to_dev(label)
+            self._tap(dx, dy)
+        except ValueError:
+            self._set_status(f"'{label}' out of range")
+
+    # ── Palette ───────────────────────────────────────────────────────────────
+
+    def _open_palette(self):
+        threading.Thread(target=self._fetch_packages, daemon=True).start()
+        data = {
+            "mode":               "palette",
+            "packages":           self._packages,
+            "clipboard":          self._read_clipboard(),
+            "deeplinks":          self._deeplinks,
+            "serial":             ARGS.serial,
+            "adb_path":           ADB_PATH,
+            "capture_bitrate":       self.capture.bitrate,
+            "capture_low_latency":   self.capture.low_latency,
+            "capture_fps_cap":       self.capture.fps_cap,
+            "capture_encode_scale":  self.capture.encode_scale,
+            "capture_stats_visible": self._stats_visible,
+        }
+        if self._palette_proc and self._palette_ready:
+            # Fast path: pre-warmed subprocess already has Python + tkinter loaded.
+            # Just send data and it shows the window immediately.
+            payload = (json.dumps(data) + "\n").encode()
+            try:
+                self._palette_proc.stdin.write(payload)
+                self._palette_proc.stdin.flush()
+                return
+            except Exception:
+                # Process died; fall through to spawn a fresh one.
+                self._palette_proc  = None
+                self._palette_ready = False
+        threading.Thread(target=self._run_proc, args=(data,), daemon=True).start()
+
+    def _run_proc(self, data, emit_result=True):
+        payload = (json.dumps(data) + "\n").encode()
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, _PROC],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            proc.stdin.write(payload)
+            proc.stdin.close()
+            threading.Thread(
+                target=self._read_proc_hints, args=(proc.stderr,), daemon=True
+            ).start()
+            stdout = proc.stdout.read()
+            proc.wait(timeout=600)
+            self._hier_highlight = None
+            if emit_result:
+                result = json.loads(stdout.decode().strip()) if stdout.strip() else None
+                self._palette_result_q.put(result)
+        except Exception as e:
+            self._hier_highlight = None
+            self._set_status(f"palette error: {e}")
+
+    def _read_proc_hints(self, stderr):
+        for raw in stderr:
+            line = raw.decode().strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+                if msg.get("action") == "tap":
+                    actions.tap(msg["cx"], msg["cy"])
+                else:
+                    bounds = msg.get("hover")
+                    if bounds:
+                        s = self.scale
+                        x1, y1, x2, y2 = bounds
+                        self._hier_highlight = (
+                            int(x1 * s), int(y1 * s), int(x2 * s), int(y2 * s)
+                        )
+                    else:
+                        self._hier_highlight = None
+            except Exception:
+                print(f"[proc stderr] {line}", flush=True)
+
+    def _read_clipboard(self):
+        try:
+            return subprocess.run(
+                ["pbpaste"], capture_output=True, text=True, timeout=1
+            ).stdout
+        except Exception:
+            return ""
+
+    # ── Palette pre-warming ───────────────────────────────────────────────────
+
+    def _preload_palette(self):
+        """Spawn palette subprocess hidden. Python + tkinter load in background.
+        When user triggers palette, the process is already warm — just send data."""
+        try:
+            cmd = [sys.executable, _PROC, "--persistent"]
+            if ARGS.serial:
+                cmd += ["--serial", ARGS.serial]
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self._palette_proc = proc
+            threading.Thread(
+                target=self._read_persistent_hints, args=(proc.stderr,), daemon=True
+            ).start()
+            threading.Thread(
+                target=self._read_persistent_results, args=(proc.stdout,), daemon=True
+            ).start()
+        except Exception as e:
+            self._set_status(f"palette preload failed: {e}")
+
+    def _read_persistent_hints(self, stderr):
+        """Read stderr from the persistent palette process.
+        Handles the __ready__ signal and live hints (hover, tap)."""
+        for raw in stderr:
+            line = raw.decode().strip()
+            if not line:
+                continue
+            if line == "__ready__":
+                self._palette_ready = True
+                continue
+            try:
+                msg = json.loads(line)
+                if msg.get("action") == "tap":
+                    actions.tap(msg["cx"], msg["cy"])
+                else:
+                    bounds = msg.get("hover")
+                    if bounds:
+                        s = self.scale
+                        x1, y1, x2, y2 = bounds
+                        self._hier_highlight = (
+                            int(x1 * s), int(y1 * s), int(x2 * s), int(y2 * s)
+                        )
+                    else:
+                        self._hier_highlight = None
+            except Exception:
+                print(f"[palette stderr] {line}", flush=True)
+
+    def _read_persistent_results(self, stdout):
+        """Read results line-by-line from the persistent palette process."""
+        for raw in stdout:
+            try:
+                result = json.loads(raw.decode().strip())
+                self._hier_highlight = None
+                self._palette_result_q.put(result)  # enqueue even None (close with no action)
+            except Exception:
+                pass
+
+    def _on_palette_action(self, result):
+        t = result.get('type')
+
+        if t == 'close':
+            return
+
+        if t == 'tap':
+            actions.tap(result['cx'], result['cy'], on_status=self._set_status)
+
+        elif t == 'install-apk':
+            path = result.get('path', '')
+            if path:
+                actions.install_apk(path, on_status=self._set_status)
+
+        elif t == 'input-text':
+            actions.input_text(result['text'], on_status=self._set_status)
+
+        elif t == 'clipboard':
+            text = result.get('value', '')
+            if text:
+                actions.input_text(text, on_status=self._set_status)
+            else:
+                self._set_status("clipboard empty")
+
+        elif t == 'deeplink':
+            url = result.get('value', '')
+            actions.launch_deeplink(url, on_status=self._set_status)
+            self._add_deeplink(url)
+
+        elif t == 'theme-changed':
+            self._set_status(f"theme set to {result.get('theme', '?')} – reopen palette to apply")
+
+        elif t == 'capture-settings':
+            import settings as _settings_mod
+            if 'stats_visible' in result:
+                self._stats_visible = bool(result['stats_visible'])
+            updates = {k: result[k] for k in ('bitrate', 'low_latency', 'fps_cap', 'encode_scale') if k in result}
+            if updates:
+                _settings_mod.save_section('capture', updates)
+                self.capture.restart_with_settings(**updates)
+                mbps = int(self.capture.bitrate) // 1_000_000
+                ll  = " + low latency" if self.capture.low_latency else ""
+                fps = f" + {self.capture.fps_cap}fps cap" if self.capture.fps_cap > 0 else ""
+                self._set_status(f"capture: {mbps}Mbps{ll}{fps} – restarting stream...")
+
+        elif t == 'app-action':
+            self._dispatch_app_action(result['pkg'], result['action'])
+
+    def _dispatch_app_action(self, pkg, action):
+        self._set_status(f"{action} {pkg}")
+        if action == "launch":
+            actions.launch(pkg, on_status=self._set_status)
+        elif action == "force-stop":
+            actions.force_stop(pkg, on_status=self._set_status)
+        elif action == "clear-data":
+            actions.clear_data(pkg, on_status=self._set_status)
+        elif action == "uninstall":
+            actions.uninstall(pkg, on_status=self._set_status)
+
+    def _refocus_window(self):
+        """Return OS focus to the pygame window after palette closes.
+
+        Uses ObjC runtime directly (libobjc.dylib) — always present on macOS,
+        no PyObjC install needed. No-op on non-macOS.
+        """
+        try:
+            import ctypes
+            import ctypes.util
+            if sys.platform != 'darwin':
+                return
+            libobjc = ctypes.cdll.LoadLibrary(ctypes.util.find_library('objc'))
+            libobjc.objc_getClass.restype = ctypes.c_void_p
+            libobjc.sel_registerName.restype = ctypes.c_void_p
+            libobjc.objc_msgSend.restype = ctypes.c_void_p
+            libobjc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            app = libobjc.objc_msgSend(
+                libobjc.objc_getClass(b'NSApplication'),
+                libobjc.sel_registerName(b'sharedApplication'),
+            )
+            # activateIgnoringOtherApps: takes a BOOL — use typed wrapper
+            fn = ctypes.CFUNCTYPE(
+                None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool
+            )(libobjc.objc_msgSend)
+            fn(app, libobjc.sel_registerName(b'activateIgnoringOtherApps:'), True)
+        except Exception:
+            pass
+
+    # ── Deeplink history ──────────────────────────────────────────────────────
+
+    _DEEPLINK_PATH = os.path.expanduser("~/.keytap_deeplinks.json")
+
+    def _load_deeplinks(self):
+        try:
+            with open(self._DEEPLINK_PATH) as f:
+                self._deeplinks = json.load(f)
+        except Exception:
+            self._deeplinks = []
+
+    def _add_deeplink(self, url):
+        if url in self._deeplinks:
+            self._deeplinks.remove(url)
+        self._deeplinks.insert(0, url)
+        self._deeplinks = self._deeplinks[:20]
+        threading.Thread(target=self._save_deeplinks, daemon=True).start()
+
+    def _save_deeplinks(self):
+        try:
+            with open(self._DEEPLINK_PATH, "w") as f:
+                json.dump(self._deeplinks, f)
+        except Exception:
+            pass
+
+    # ── Package list ──────────────────────────────────────────────────────────
 
     def _fetch_packages(self):
         result = adb("shell", "pm", "list", "packages")
@@ -399,245 +532,128 @@ class KeyTap:
         )
         self._packages_ready = True
 
-    _DEEPLINK_HISTORY_PATH = os.path.expanduser("~/.keytap_deeplinks.json")
+    # ── Draw ──────────────────────────────────────────────────────────────────
 
-    def _load_deeplink_history(self):
-        try:
-            with open(self._DEEPLINK_HISTORY_PATH) as f:
-                self._deeplink_history = json.load(f)
-        except Exception:
-            self._deeplink_history = []
+    def _draw(self):
+        self.screen.fill((0, 0, 0))
 
-    def _save_deeplink_history(self):
-        try:
-            with open(self._DEEPLINK_HISTORY_PATH, "w") as f:
-                json.dump(self._deeplink_history, f)
-        except Exception:
-            pass
+        if self._raw_surf is not None:
+            frame = self._raw_surf.copy()
+            elems = self.elements.elements_for_renderer() if self.elements.active else None
+            composited = self.renderer.composite(
+                frame,
+                self.cursor_row, self.cursor_col,
+                self.input_buf,
+                elements=elems,
+                highlight_bounds=self._hier_highlight,
+            )
+            self.screen.blit(composited, (0, 0))
 
-    def _read_clipboard(self):
-        try:
-            return subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=1).stdout
-        except Exception:
-            return ""
+        self._draw_status()
+        if self._stats_visible:
+            self._draw_stats()
+        pygame.display.flip()
 
-    def _open_palette(self):
-        if self._palette and self._palette.win.winfo_exists():
-            self._palette.win.lift()
-            self._palette.win.focus_force()
+    def _draw_status(self):
+        bar_y = self.win_h
+        pygame.draw.rect(self.screen, (26, 26, 26),
+                         (0, bar_y, self.win_w, STATUS_H))
+        if self._status_font:
+            t = self._status_font.render(self._status[:120], True, (136, 136, 136))
+            self.screen.blit(t, (8, bar_y + (STATUS_H - t.get_height()) // 2))
+
+    def _draw_stats(self):
+        s    = self.capture.stats
+        font = self._status_font
+        if not font:
             return
-        if not self._packages_ready:
-            self.status("package list still loading...")
-            return
-        self._palette = CommandPalette(
-            self.root, self._packages,
-            on_action=self._on_palette_action,
-            clipboard_text=self._read_clipboard(),
-            deeplink_history=self._deeplink_history,
-            serial=ARGS.serial,
-        )
+        lines = [
+            ("F1 hide stats",                           (90,  90,  90)),
+            (f"producer  {s['producer_fps']:.0f} fps",  (0,  210,  90)),
+            (f"dropped   {s['dropped_ps']} /s",         (220, 120,  40) if s['dropped_ps'] else (0, 210, 90)),
+            (f"stall     {s['stall_ms']:.0f} ms",       (220, 120,  40) if s['stall_ms'] > 50 else (0, 210, 90)),
+            (f"consumer  {self._consumer_fps:.0f} fps", (0,  210,  90)),
+            (f"render    {self._render_ms:.1f} ms",     (220, 120,  40) if self._render_ms > 8 else (0, 210, 90)),
+        ]
+        pad    = 6
+        line_h = font.get_height() + 4
+        box_w  = 190
+        box_h  = len(lines) * line_h + pad * 2
+        x      = self.win_w - box_w - 10
+        y      = 10
+        pygame.draw.rect(self.screen, (12, 12, 12),  (x - pad, y - pad, box_w + pad * 2, box_h))
+        pygame.draw.rect(self.screen, (55, 55, 55),  (x - pad, y - pad, box_w + pad * 2, box_h), 1)
+        for i, (text, color) in enumerate(lines):
+            surf = font.render(text, True, color)
+            self.screen.blit(surf, (x, y + i * line_h))
 
-    def _on_palette_action(self, pkg, action):
-        if pkg == "__install-apk__":
-            self.root.after(100, self._do_install_apk)
-            return
-        if pkg == "__set-theme__":
-            self.root.after(150, self._open_palette)
-            return
-        if pkg == "__dev-options__":
-            threading.Thread(target=self._fetch_dev_options, daemon=True).start()
-            return
-        if pkg == "__quick-toggle__":
-            threading.Thread(target=lambda k=action: self._do_quick_toggle(k), daemon=True).start()
-            return
-        if pkg == "__view-hierarchy__":
-            threading.Thread(target=self._fetch_hierarchy, daemon=True).start()
-            return
-        if pkg == "__tap-hierarchy__":
-            cx, cy = action.split(",")
-            self._run_adb("shell", "input", "tap", cx, cy)
-            self.status(f"tapped ({cx},{cy})")
-            return
-        if pkg == "__refresh-hierarchy__":
-            self.status("refreshing hierarchy...")
-            threading.Thread(target=self._fetch_hierarchy, daemon=True).start()
-            return
-        if pkg == "__input-text__":
-            text = action
-            if not text:
-                return
-            self.status("input text")
-            self._run_adb("shell", "input", "text", text.replace(" ", "%s"))
-            return
-        if pkg == "__clipboard__":
-            text = action  # action holds the clipboard string
-            if not text:
-                self.status("clipboard empty")
-                return
-            self.status("paste clipboard")
-            self._run_adb("shell", "input", "text", text.replace(" ", "%s"))
-            return
-        if pkg == "__deeplink__":
-            url = action
-            self.status(f"launch {url}")
-            self._run_adb("shell", "am", "start", "-a",
-                          "android.intent.action.VIEW", "-d", url)
-            if url in self._deeplink_history:
-                self._deeplink_history.remove(url)
-            self._deeplink_history.insert(0, url)
-            self._deeplink_history = self._deeplink_history[:20]
-            threading.Thread(target=self._save_deeplink_history, daemon=True).start()
-            return
-        self.status(f"{action} {pkg}")
-        if action == "launch":
-            self._run_adb("shell", "monkey", "-p", pkg,
-                          "-c", "android.intent.category.LAUNCHER", "1")
-        elif action == "force-stop":
-            self._run_adb("shell", "am", "force-stop", pkg)
-        elif action == "clear-data":
-            self._run_adb("shell", "pm", "clear", pkg)
-        elif action == "uninstall":
-            self._run_adb("shell", "pm", "uninstall", pkg)
-        elif action == "shared-prefs":
-            self.status(f"reading shared prefs {pkg}...")
-            threading.Thread(target=lambda p=pkg: self._fetch_shared_prefs(p), daemon=True).start()
-        elif action == "remote-config":
-            self.status(f"reading remote config {pkg}...")
-            threading.Thread(target=lambda p=pkg: self._fetch_remote_config(p), daemon=True).start()
-        elif action == "litmus":
-            self.status(f"reading litmus {pkg}...")
-            threading.Thread(target=lambda p=pkg: self._fetch_litmus(p), daemon=True).start()
-        elif action == "permissions":
-            self.status(f"reading permissions {pkg}...")
-            threading.Thread(target=lambda p=pkg: self._fetch_permissions(p), daemon=True).start()
-
-    # ── APK installer ────────────────────────────────────────────────────────
-
-    def _do_install_apk(self):
-        from tkinter import filedialog
-        path = filedialog.askopenfilename(
-            title="Select APK to install",
-            filetypes=[("APK files", "*.apk"), ("All files", "*.*")],
-        )
-        if not path:
-            return
-        self.status(f"installing {os.path.basename(path)}...")
-        threading.Thread(target=lambda: self._run_install_apk(path), daemon=True).start()
-
-    def _run_install_apk(self, path):
-        result = adb("install", "-r", path)
-        out = (result.stdout + result.stderr).decode(errors="replace")
-        if "Success" in out:
-            msg = f"installed {os.path.basename(path)}"
-        else:
-            lines = [l.strip() for l in out.splitlines() if l.strip()]
-            msg = lines[-1] if lines else "install failed"
-        self.root.after(0, lambda: self.status(msg))
-
-    # ── Inspector fetchers (delegate to inspectors package) ───────────────────
-
-    _QUICK_TOGGLE_LABELS = {
-        "wifi":        "WiFi",
-        "dark_mode":   "Dark Mode",
-        "mobile_data": "Mobile Data",
-    }
-
-    def _do_quick_toggle(self, key):
-        label = self._QUICK_TOGGLE_LABELS.get(key, key)
-        new_state = dev_options.toggle_by_label(label, ARGS.serial)
-        self.root.after(0, lambda: self.status(f"{label}: {new_state}"))
-
-    def _fetch_dev_options(self):
-        items = dev_options.fetch(ARGS.serial)
-        def on_select(label, _state):
-            self.status(f"toggling {label}...")
-            threading.Thread(target=lambda: self._toggle_dev_option(label), daemon=True).start()
-        self.root.after(0, lambda: self._on_viewer_loaded("Dev Options", items, on_select=on_select))
-
-    def _toggle_dev_option(self, label):
-        dev_options.toggle_by_label(label, ARGS.serial)
-        items = dev_options.fetch(ARGS.serial)
-        self.root.after(0, lambda i=items: self._on_dev_options_refresh(i))
-
-    def _on_dev_options_refresh(self, items):
-        if self._palette and self._palette.win.winfo_exists():
-            self._palette.update_viewer_items(items)
-
-    def _fetch_shared_prefs(self, pkg):
-        items = shared_prefs.fetch(pkg)
-        self.root.after(0, lambda: self._on_viewer_loaded("Shared Prefs", items))
-
-    def _fetch_remote_config(self, pkg):
-        items = remote_config.fetch(pkg)
-        self.root.after(0, lambda: self._on_viewer_loaded("Remote Config", items))
-
-    def _fetch_litmus(self, pkg):
-        items, raw_by_name = litmus.fetch(pkg)
-        def on_select(key, _display):
-            litmus.open_nano(key, raw_by_name.get(key, "{}"))
-        self.root.after(0, lambda: self._on_viewer_loaded("Litmus", items, on_select=on_select))
-
-    def _fetch_permissions(self, pkg, _refresh=False):
-        items = permissions.fetch(pkg)
-        def on_select(perm, state):
-            if state.startswith("GRANTED"):
-                self._run_adb("shell", "pm", "revoke", pkg, perm)
-                self.status(f"revoked {perm}")
-            else:
-                self._run_adb("shell", "pm", "grant", pkg, perm)
-                self.status(f"granted {perm}")
-            threading.Timer(0.6, lambda p=pkg: self._refresh_permissions(p)).start()
-        if _refresh:
-            self.root.after(0, lambda i=items: self._on_permissions_refresh(i))
-        else:
-            self.root.after(0, lambda: self._on_viewer_loaded("Permissions", items, on_select=on_select))
-
-    def _refresh_permissions(self, pkg):
-        self._fetch_permissions(pkg, _refresh=True)
-
-    def _on_permissions_refresh(self, items):
-        if self._palette and self._palette.win.winfo_exists():
-            self._palette.update_viewer_items(items)
-
-    def _fetch_hierarchy(self):
-        try:
-            root_node, flat_nodes = dump_hierarchy_tree(ARGS.serial)
-            self.root.after(0, lambda: self._on_hierarchy_loaded(root_node, flat_nodes))
-        except Exception as e:
-            self.root.after(0, lambda: self.status(f"hierarchy error: {e}"))
-
-    def _on_hier_hover(self, bounds):
-        if bounds:
-            s = self.scale
-            x1, y1, x2, y2 = bounds
-            self._hier_highlight = (int(x1 * s), int(y1 * s), int(x2 * s), int(y2 * s))
-        else:
-            self._hier_highlight = None
-        self.redraw()
-
-    def _on_hierarchy_loaded(self, root_node, flat_nodes):
-        self.status(f"hierarchy: {len(flat_nodes)} nodes")
-        if self._palette and self._palette.win.winfo_exists():
-            self._palette.show_hierarchy(root_node, flat_nodes, on_hover=self._on_hier_hover)
-
-    def _on_viewer_loaded(self, title, items, on_select=None):
-        self.status(f"{title}: {len(items)} keys")
-        if self._palette and self._palette.win.winfo_exists():
-            self._palette.show_viewer(title, items, on_select=on_select)
-
-    # ── Run ──────────────────────────────────────────────────────────────────
+    # ── Main loop ─────────────────────────────────────────────────────────────
 
     def run(self):
-        self._load_deeplink_history()
+        from settings import save_defaults
+        save_defaults()
+        self._load_deeplinks()
         threading.Thread(target=self._fetch_packages, daemon=True).start()
-        self._capture.start()
-        self._display_loop()
-        self.root.mainloop()
+        self._preload_palette()
+        self.capture.start()
 
+        running = True
+        while running:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+
+                elif event.type == pygame.KEYDOWN:
+                    if not self._handle_key(event):
+                        running = False
+
+            # Drain all queued frames, keep only the latest to stay in sync
+            raw_frame = None
+            try:
+                while True:
+                    raw_frame = self.capture.frame_q.get_nowait()
+            except queue.Empty:
+                pass
+            if raw_frame is not None:
+                # Direct bytes -> Surface: skips PIL tobytes() copy, ~2-10ms faster per frame
+                self._raw_surf = pygame.image.frombytes(
+                    raw_frame, (self.capture.win_w, self.capture.win_h), 'RGB'
+                )
+                self._idle_status()
+                if self.elements.active and not self.elements.loading:
+                    if self.elements.check_screen_change(self._raw_surf):
+                        self.elements.enter(ref_surf=self._raw_surf)
+                # Consumer fps accounting
+                self._consumer_frames += 1
+                now = time.time()
+                if self._consumer_t == 0.0:
+                    self._consumer_t = now
+                elif now - self._consumer_t >= 1.0:
+                    self._consumer_fps = self._consumer_frames / (now - self._consumer_t)
+                    self._consumer_frames = 0
+                    self._consumer_t = now
+
+            # Process palette subprocess results
+            try:
+                result = self._palette_result_q.get_nowait()
+                if result:
+                    self._on_palette_action(result)
+                self._refocus_window()
+            except queue.Empty:
+                pass
+
+            t_draw = time.time()
+            self._draw()
+            self._render_ms = (time.time() - t_draw) * 1000
+            self.clock.tick(120)
+
+        self.capture.stop()
+        pygame.quit()
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    from adb import list_devices
-
     if not ARGS.serial:
         devices = list_devices()
         if not devices:
@@ -648,8 +664,8 @@ def main():
             print(f"Device: {ARGS.serial}")
         else:
             print("Multiple devices found:")
-            for i, serial in enumerate(devices):
-                print(f"  [{i + 1}] {serial}")
+            for i, s in enumerate(devices):
+                print(f"  [{i + 1}] {s}")
             while True:
                 try:
                     choice = int(input(f"Select device [1-{len(devices)}]: ")) - 1
