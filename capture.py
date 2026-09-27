@@ -7,6 +7,7 @@ from PIL import Image
 
 from config import ARGS, HAS_FFMPEG
 from adb import adb, take_screencap
+from settings import section as _s
 
 
 class CaptureManager:
@@ -16,14 +17,16 @@ class CaptureManager:
     frame_q always contains PIL RGB Images sized (win_w, win_h).
     """
 
-    BITRATE = "8000000"
-
     def __init__(self, win_w, win_h, on_status):
-        self.win_w      = win_w
-        self.win_h      = win_h
-        self._on_status = on_status   # callable(str), must be thread-safe
-        self.frame_q    = queue.Queue(maxsize=1)
-        self._running   = True
+        self.win_w       = win_w
+        self.win_h       = win_h
+        self._on_status  = on_status   # callable(str), must be thread-safe
+        self.frame_q     = queue.Queue(maxsize=1)
+        self._running    = True
+        self._adb_proc   = None
+        cap = _s("capture")
+        self.bitrate     = str(cap.get("bitrate", "8000000"))
+        self.low_latency = bool(cap.get("low_latency", False))
 
     def start(self):
         if HAS_FFMPEG:
@@ -34,6 +37,18 @@ class CaptureManager:
 
     def stop(self):
         self._running = False
+
+    def restart_with_settings(self, bitrate=None, low_latency=None):
+        """Apply new capture settings and restart the stream immediately."""
+        if bitrate is not None:
+            self.bitrate = str(bitrate)
+        if low_latency is not None:
+            self.low_latency = bool(low_latency)
+        if self._adb_proc:
+            try:
+                self._adb_proc.terminate()
+            except Exception:
+                pass
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 
@@ -77,12 +92,14 @@ class CaptureManager:
         adb_cmd = self._adb_args() + [
             "shell", "screenrecord",
             "--output-format=h264",
-            f"--bit-rate={self.BITRATE}",
+            f"--bit-rate={self.bitrate}",
             "-",
         ]
-        ffmpeg_cmd = [
-            "ffmpeg", "-loglevel", "quiet",
-            "-hwaccel", "videotoolbox",
+        ffmpeg_cmd = ["ffmpeg", "-loglevel", "quiet", "-hwaccel", "videotoolbox"]
+        if self.low_latency:
+            ffmpeg_cmd += ["-flags", "low_delay", "-fflags", "nobuffer",
+                           "-probesize", "32", "-analyzeduration", "0"]
+        ffmpeg_cmd += [
             "-i", "pipe:0",
             "-vf", f"scale={self.win_w}:{self.win_h}",
             "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
@@ -100,6 +117,7 @@ class CaptureManager:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
             )
+            self._adb_proc = adb_proc
         except Exception as e:
             self._on_status(f"capture start error: {e}")
             return False

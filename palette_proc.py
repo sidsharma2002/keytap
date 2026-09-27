@@ -68,6 +68,14 @@ BUILT_IN = [
     ("  Dev Options       – toggle ADB settings", "dev-options"),
     ("  Install APK       – install from file",   "install-apk"),
     ("  Theme             – switch color theme",  "theme-switcher"),
+    ("  Capture Settings  – stream quality",      "capture-settings"),
+]
+
+_BITRATE_PRESETS = [
+    ("2 Mbps  – lowest lag",    "2000000"),
+    ("4 Mbps  – balanced",      "4000000"),
+    ("8 Mbps  – default",       "8000000"),
+    ("16 Mbps – best quality",  "16000000"),
 ]
 
 APP_ACTIONS = [
@@ -309,6 +317,8 @@ class PaletteWindow:
                 self._pick_and_emit_apk()
             elif vtype == "theme-switcher":
                 self._enter_themes()
+            elif vtype == "capture-settings":
+                self._enter_capture_settings()
             else:
                 self._emit({"type": vtype})
         elif self.state == "actions":
@@ -322,6 +332,13 @@ class PaletteWindow:
         elif self.state == "viewer":
             if self._viewer_on_enter:
                 self._viewer_on_enter(idx)
+        elif self.state == "capture-settings":
+            label, vtype, vvalue = self._shown[idx]
+            if vtype == "cap-bitrate":
+                self._emit({"type": "capture-settings", "bitrate": vvalue})
+            elif vtype == "cap-latency":
+                cur_ll = bool(self.data.get("capture_low_latency", False))
+                self._emit({"type": "capture-settings", "low_latency": not cur_ll})
         elif self.state == "input":
             text = self._var.get().strip()
             if text:
@@ -359,7 +376,7 @@ class PaletteWindow:
             else:
                 self._send_hover(None)
                 self._enter_search()
-        elif self.state in ("actions", "input", "viewer"):
+        elif self.state in ("actions", "input", "viewer", "capture-settings"):
             self._enter_search()
         else:
             self._emit(None)
@@ -756,6 +773,23 @@ class PaletteWindow:
         except Exception:
             pass
         self._emit({"type": "theme-changed", "theme": name})
+
+    def _enter_capture_settings(self):
+        self.state = "capture-settings"
+        self._var.set("")
+        self._prompt.config(text="capture  >")
+        self._footer.config(text="Enter=apply  Esc=back")
+        cur_br = str(self.data.get("capture_bitrate", "8000000"))
+        cur_ll = bool(self.data.get("capture_low_latency", False))
+        items = []
+        for label, val in _BITRATE_PRESETS:
+            dot = "●" if val == cur_br else " "
+            items.append((f"  {dot}  Bitrate: {label}", "cap-bitrate", val))
+        dot = "●" if cur_ll else " "
+        ll_str = "ON" if cur_ll else "OFF"
+        items.append((f"  {dot}  Low Latency: {ll_str}", "cap-latency", "toggle"))
+        self._shown = items
+        self._set_items(items)
 
     # ── Emit ──────────────────────────────────────────────────────────────────
 

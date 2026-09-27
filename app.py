@@ -262,12 +262,14 @@ class KeyTap:
     def _open_palette(self):
         threading.Thread(target=self._fetch_packages, daemon=True).start()
         data = {
-            "mode":      "palette",
-            "packages":  self._packages,
-            "clipboard": self._read_clipboard(),
-            "deeplinks": self._deeplinks,
-            "serial":    ARGS.serial,
-            "adb_path":  ADB_PATH,
+            "mode":               "palette",
+            "packages":           self._packages,
+            "clipboard":          self._read_clipboard(),
+            "deeplinks":          self._deeplinks,
+            "serial":             ARGS.serial,
+            "adb_path":           ADB_PATH,
+            "capture_bitrate":    self.capture.bitrate,
+            "capture_low_latency": self.capture.low_latency,
         }
         if self._palette_proc and self._palette_ready:
             # Fast path: pre-warmed subprocess already has Python + tkinter loaded.
@@ -428,6 +430,16 @@ class KeyTap:
 
         elif t == 'theme-changed':
             self._set_status(f"theme set to {result.get('theme', '?')} – reopen palette to apply")
+
+        elif t == 'capture-settings':
+            import settings as _settings_mod
+            updates = {k: result[k] for k in ('bitrate', 'low_latency') if k in result}
+            if updates:
+                _settings_mod.save_section('capture', updates)
+                self.capture.restart_with_settings(**updates)
+                mbps = int(self.capture.bitrate) // 1_000_000
+                ll = " + low latency" if self.capture.low_latency else ""
+                self._set_status(f"capture: {mbps}Mbps{ll} – restarting stream...")
 
         elif t == 'app-action':
             self._dispatch_app_action(result['pkg'], result['action'])
