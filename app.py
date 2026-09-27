@@ -444,19 +444,32 @@ class KeyTap:
             actions.uninstall(pkg, on_status=self._set_status)
 
     def _refocus_window(self):
-        """Return OS focus to the pygame window after palette closes."""
+        """Return OS focus to the pygame window after palette closes.
+
+        Uses ObjC runtime directly (libobjc.dylib) — always present on macOS,
+        no PyObjC install needed. No-op on non-macOS.
+        """
         try:
-            from AppKit import NSApp
-            NSApp.activateIgnoringOtherApps_(True)
+            import ctypes
+            import ctypes.util
+            if sys.platform != 'darwin':
+                return
+            libobjc = ctypes.cdll.LoadLibrary(ctypes.util.find_library('objc'))
+            libobjc.objc_getClass.restype = ctypes.c_void_p
+            libobjc.sel_registerName.restype = ctypes.c_void_p
+            libobjc.objc_msgSend.restype = ctypes.c_void_p
+            libobjc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            app = libobjc.objc_msgSend(
+                libobjc.objc_getClass(b'NSApplication'),
+                libobjc.sel_registerName(b'sharedApplication'),
+            )
+            # activateIgnoringOtherApps: takes a BOOL — use typed wrapper
+            fn = ctypes.CFUNCTYPE(
+                None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool
+            )(libobjc.objc_msgSend)
+            fn(app, libobjc.sel_registerName(b'activateIgnoringOtherApps:'), True)
         except Exception:
-            try:
-                subprocess.Popen(
-                    ['osascript', '-e',
-                     f'tell application "System Events" to set frontmost of'
-                     f' process id {os.getpid()} to true'],
-                )
-            except Exception:
-                pass
+            pass
 
     # ── Deeplink history ──────────────────────────────────────────────────────
 
