@@ -36,7 +36,7 @@ class KeyTap:
         pygame.display.set_caption("keytap")
 
         # ── Components ────────────────────────────────────────────────────────
-        self.capture  = CaptureManager(self.win_w, self.win_h,
+        self.capture  = CaptureManager(self.win_w, self.win_h, dev_w, dev_h,
                                        on_status=self._set_status)
         self.renderer = GridRenderer(self.win_w, self.win_h)
         self.renderer.init_fonts()
@@ -275,9 +275,10 @@ class KeyTap:
             "deeplinks":          self._deeplinks,
             "serial":             ARGS.serial,
             "adb_path":           ADB_PATH,
-            "capture_bitrate":      self.capture.bitrate,
-            "capture_low_latency":  self.capture.low_latency,
-            "capture_fps_cap":      self.capture.fps_cap,
+            "capture_bitrate":       self.capture.bitrate,
+            "capture_low_latency":   self.capture.low_latency,
+            "capture_fps_cap":       self.capture.fps_cap,
+            "capture_encode_scale":  self.capture.encode_scale,
             "capture_stats_visible": self._stats_visible,
         }
         if self._palette_proc and self._palette_ready:
@@ -444,7 +445,7 @@ class KeyTap:
             import settings as _settings_mod
             if 'stats_visible' in result:
                 self._stats_visible = bool(result['stats_visible'])
-            updates = {k: result[k] for k in ('bitrate', 'low_latency', 'fps_cap') if k in result}
+            updates = {k: result[k] for k in ('bitrate', 'low_latency', 'fps_cap', 'encode_scale') if k in result}
             if updates:
                 _settings_mod.save_section('capture', updates)
                 self.capture.restart_with_settings(**updates)

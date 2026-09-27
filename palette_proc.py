@@ -85,6 +85,13 @@ _FPS_PRESETS = [
     ("30 fps  – balanced (recommended)", 30),
 ]
 
+_ENCODE_SCALE_PRESETS = [
+    ("100%  – native (default)",        1.0),
+    ("75%   – smaller I-frames",        0.75),
+    ("50%   – half res, ~4x less stall", 0.5),
+    ("25%   – thumbnail quality",       0.25),
+]
+
 APP_ACTIONS = [
     ("  Launch",        "launch"),
     ("  Force Stop",    "force-stop"),
@@ -351,6 +358,8 @@ class PaletteWindow:
                 self._emit({"type": "capture-settings", "low_latency": not cur_ll})
             elif vtype == "cap-fps":
                 self._emit({"type": "capture-settings", "fps_cap": vvalue})
+            elif vtype == "cap-encode-scale":
+                self._emit({"type": "capture-settings", "encode_scale": vvalue})
             elif vtype == "cap-stats":
                 cur_sv = bool(self.data.get("capture_stats_visible", False))
                 self._emit({"type": "capture-settings", "stats_visible": not cur_sv})
@@ -807,6 +816,10 @@ class PaletteWindow:
         for label, val in _FPS_PRESETS:
             dot = "●" if val == cur_fps else " "
             items.append((f"  {dot}  FPS Cap: {label}", "cap-fps", val))
+        cur_es = float(self.data.get("capture_encode_scale", 1.0))
+        for label, val in _ENCODE_SCALE_PRESETS:
+            dot = "●" if val == cur_es else " "
+            items.append((f"  {dot}  Encode Size: {label}", "cap-encode-scale", val))
         cur_sv = bool(self.data.get("capture_stats_visible", False))
         dot = "●" if cur_sv else " "
         sv_str = "ON" if cur_sv else "OFF"

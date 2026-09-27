@@ -18,17 +18,20 @@ class CaptureManager:
     Callers convert to pygame Surface with pygame.image.frombytes().
     """
 
-    def __init__(self, win_w, win_h, on_status):
-        self.win_w       = win_w
-        self.win_h       = win_h
-        self._on_status  = on_status   # callable(str), must be thread-safe
-        self.frame_q     = queue.Queue(maxsize=1)
-        self._running    = True
-        self._adb_proc   = None
+    def __init__(self, win_w, win_h, dev_w, dev_h, on_status):
+        self.win_w        = win_w
+        self.win_h        = win_h
+        self.dev_w        = dev_w
+        self.dev_h        = dev_h
+        self._on_status   = on_status   # callable(str), must be thread-safe
+        self.frame_q      = queue.Queue(maxsize=1)
+        self._running     = True
+        self._adb_proc    = None
         cap = _s("capture")
-        self.bitrate     = str(cap.get("bitrate", "8000000"))
-        self.low_latency = bool(cap.get("low_latency", False))
-        self.fps_cap     = int(cap.get("fps_cap", 0))
+        self.bitrate      = str(cap.get("bitrate", "8000000"))
+        self.low_latency  = bool(cap.get("low_latency", False))
+        self.fps_cap      = int(cap.get("fps_cap", 0))
+        self.encode_scale = float(cap.get("encode_scale", 1.0))
 
         # Live stats (read by main thread, written by capture thread — GIL safe)
         self.stats       = {"producer_fps": 0.0, "dropped_ps": 0, "stall_ms": 0.0}
@@ -46,7 +49,7 @@ class CaptureManager:
     def stop(self):
         self._running = False
 
-    def restart_with_settings(self, bitrate=None, low_latency=None, fps_cap=None):
+    def restart_with_settings(self, bitrate=None, low_latency=None, fps_cap=None, encode_scale=None):
         """Apply new capture settings and restart the stream immediately."""
         if bitrate is not None:
             self.bitrate = str(bitrate)
@@ -54,6 +57,8 @@ class CaptureManager:
             self.low_latency = bool(low_latency)
         if fps_cap is not None:
             self.fps_cap = int(fps_cap)
+        if encode_scale is not None:
+            self.encode_scale = float(encode_scale)
         if self._adb_proc:
             try:
                 self._adb_proc.terminate()
@@ -111,12 +116,15 @@ class CaptureManager:
         """One screenrecord session. Returns True if it ran for a meaningful time."""
         frame_bytes = self.win_w * self.win_h * 3  # RGB24
 
-        adb_cmd = self._adb_args() + [
-            "shell", "screenrecord",
+        adb_cmd = self._adb_args() + ["shell", "screenrecord",
             "--output-format=h264",
             f"--bit-rate={self.bitrate}",
-            "-",
         ]
+        if self.encode_scale < 1.0:
+            ew = int(self.dev_w * self.encode_scale) & ~1  # must be even
+            eh = int(self.dev_h * self.encode_scale) & ~1
+            adb_cmd += [f"--size={ew}x{eh}"]
+        adb_cmd += ["-"]
         ffmpeg_cmd = ["ffmpeg", "-loglevel", "quiet", "-hwaccel", "videotoolbox"]
         if self.low_latency:
             ffmpeg_cmd += ["-flags", "low_delay", "-fflags", "nobuffer+discardcorrupt",
