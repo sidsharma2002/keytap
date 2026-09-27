@@ -406,6 +406,7 @@ class PaletteWindow:
     # ── Hierarchy state ───────────────────────────────────────────────────────
 
     def _enter_hierarchy_loading(self):
+        print("[DEBUG][palette_proc] _enter_hierarchy_loading called", file=sys.stderr, flush=True)
         self.state = "hierarchy"
         self._hier_nav_stack = []
         self._hier_current_nodes = []
@@ -417,14 +418,22 @@ class PaletteWindow:
         self._lb.delete(0, "end")
         self._lb.insert("end", "  loading...")
         self._footer.config(text="fetching UI hierarchy from device...")
+        print("[DEBUG][palette_proc] starting _bg_fetch_hierarchy thread", file=sys.stderr, flush=True)
         threading.Thread(target=self._bg_fetch_hierarchy, daemon=True).start()
 
     def _bg_fetch_hierarchy(self):
+        import time as _t
+        _t0 = _t.time()
+        print(f"[DEBUG][hierarchy] fetch start, u2 preconnected={_u2_dev is not None}", file=sys.stderr, flush=True)
         try:
             from inspectors.hierarchy import dump_hierarchy_tree
-            root_node, flat_nodes = dump_hierarchy_tree(self._serial)
+            root_node, flat_nodes = dump_hierarchy_tree(self._serial, u2_dev=_u2_dev)
+            _elapsed = _t.time() - _t0
+            print(f"[DEBUG][hierarchy] fetch done in {_elapsed:.2f}s, {len(flat_nodes)} nodes", file=sys.stderr, flush=True)
             self.root.after(0, lambda: self._show_hierarchy(root_node, flat_nodes))
         except Exception as e:
+            _elapsed = _t.time() - _t0
+            print(f"[DEBUG][hierarchy] fetch error after {_elapsed:.2f}s: {e}", file=sys.stderr, flush=True)
             self.root.after(0, lambda: self._footer.config(text=f"error: {e}"))
 
     def _show_hierarchy(self, root_node, flat_nodes):
@@ -540,6 +549,7 @@ class PaletteWindow:
         else:
             self._viewer_on_enter = None
 
+        print(f"[DEBUG][palette_proc] _enter_viewer called: {fetch_type}", file=sys.stderr, flush=True)
         self.state = "viewer"
         self._viewer_raw_items = []
         self._var.set("")
@@ -547,11 +557,15 @@ class PaletteWindow:
         self._lb.delete(0, "end")
         self._lb.insert("end", "  Loading...")
         self._footer.config(text="Loading...  Esc=back")
+        print(f"[DEBUG][palette_proc] starting _bg_fetch_viewer thread: {fetch_type}", file=sys.stderr, flush=True)
         threading.Thread(
             target=self._bg_fetch_viewer, args=(fetch_type, pkg), daemon=True
         ).start()
 
     def _bg_fetch_viewer(self, fetch_type, pkg=None):
+        import time as _t
+        _t0 = _t.time()
+        print(f"[DEBUG][viewer] fetch start: {fetch_type}", file=sys.stderr, flush=True)
         raw_items = []
         interactive = False
         try:
@@ -583,7 +597,11 @@ class PaletteWindow:
         except Exception as e:
             raw_items = [("error", str(e))]
             label = fetch_type
+            _elapsed = _t.time() - _t0
+            print(f"[DEBUG][viewer] fetch error after {_elapsed:.2f}s: {e}", file=sys.stderr, flush=True)
 
+        _elapsed = _t.time() - _t0
+        print(f"[DEBUG][viewer] fetch done in {_elapsed:.2f}s, {len(raw_items)} items", file=sys.stderr, flush=True)
         # Format tuples as display strings
         bracket = fetch_type == "dev-options"
         items = []
@@ -810,6 +828,20 @@ class ViewerWindow:
 
 # ── Persistent mode ───────────────────────────────────────────────────────────
 
+_u2_dev = None  # pre-connected uiautomator2 device, or None
+
+
+def _preconnect_u2(serial):
+    global _u2_dev
+    try:
+        import uiautomator2 as u2
+        print(f"[DEBUG][palette_proc] pre-connecting u2, serial={serial!r}", file=sys.stderr, flush=True)
+        _u2_dev = u2.connect(serial) if serial else u2.connect()
+        print(f"[DEBUG][palette_proc] u2 pre-connect done", file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"[DEBUG][palette_proc] u2 pre-connect failed: {e}", file=sys.stderr, flush=True)
+
+
 def _persistent_main():
     """Keep process alive. On each JSON line from stdin, re-open the palette.
     Python + tkinter are already loaded, so the window appears with no startup lag.
@@ -817,6 +849,14 @@ def _persistent_main():
     root = tk.Tk()
     root.withdraw()          # start hidden
     root._persistent = True  # signals _emit() to hide instead of destroy
+
+    # Pre-connect u2 in background — serial passed via --serial CLI arg
+    try:
+        from config import ARGS as _cfg_args
+        _serial = _cfg_args.serial
+    except Exception:
+        _serial = None
+    threading.Thread(target=_preconnect_u2, args=(_serial,), daemon=True).start()
 
     sys.stderr.write("__ready__\n")
     sys.stderr.flush()

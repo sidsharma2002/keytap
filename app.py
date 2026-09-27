@@ -58,6 +58,8 @@ class KeyTap:
         self._hier_highlight   = None    # (wx1, wy1, wx2, wy2)
         self._last_shift_t     = 0.0
         self._palette_result_q = queue.Queue()
+        self._palette_proc     = None   # pre-warmed palette subprocess
+        self._palette_ready    = False  # True once subprocess signals __ready__
 
         # Package list (for palette)
         self._packages         = []
@@ -258,6 +260,7 @@ class KeyTap:
     # ── Palette ───────────────────────────────────────────────────────────────
 
     def _open_palette(self):
+        print(f"[palette] open — proc={self._palette_proc is not None} ready={self._palette_ready} pkgs={len(self._packages)}", flush=True)
         data = {
             "mode":      "palette",
             "packages":  self._packages,
@@ -266,6 +269,18 @@ class KeyTap:
             "serial":    ARGS.serial,
             "adb_path":  ADB_PATH,
         }
+        if self._palette_proc and self._palette_ready:
+            # Fast path: pre-warmed subprocess already has Python + tkinter loaded.
+            # Just send data and it shows the window immediately.
+            payload = (json.dumps(data) + "\n").encode()
+            try:
+                self._palette_proc.stdin.write(payload)
+                self._palette_proc.stdin.flush()
+                return
+            except Exception:
+                # Process died; fall through to spawn a fresh one.
+                self._palette_proc  = None
+                self._palette_ready = False
         threading.Thread(target=self._run_proc, args=(data,), daemon=True).start()
 
     def _run_proc(self, data, emit_result=True):
@@ -292,8 +307,11 @@ class KeyTap:
 
     def _read_proc_hints(self, stderr):
         for raw in stderr:
+            line = raw.decode().strip()
+            if not line:
+                continue
             try:
-                msg = json.loads(raw.decode().strip())
+                msg = json.loads(line)
                 if msg.get("action") == "tap":
                     actions.tap(msg["cx"], msg["cy"])
                 else:
@@ -307,7 +325,7 @@ class KeyTap:
                     else:
                         self._hier_highlight = None
             except Exception:
-                pass
+                print(f"[proc stderr] {line}", flush=True)
 
     def _read_clipboard(self):
         try:
@@ -316,6 +334,70 @@ class KeyTap:
             ).stdout
         except Exception:
             return ""
+
+    # ── Palette pre-warming ───────────────────────────────────────────────────
+
+    def _preload_palette(self):
+        """Spawn palette subprocess hidden. Python + tkinter load in background.
+        When user triggers palette, the process is already warm — just send data."""
+        try:
+            cmd = [sys.executable, _PROC, "--persistent"]
+            if ARGS.serial:
+                cmd += ["--serial", ARGS.serial]
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self._palette_proc = proc
+            threading.Thread(
+                target=self._read_persistent_hints, args=(proc.stderr,), daemon=True
+            ).start()
+            threading.Thread(
+                target=self._read_persistent_results, args=(proc.stdout,), daemon=True
+            ).start()
+        except Exception as e:
+            self._set_status(f"palette preload failed: {e}")
+
+    def _read_persistent_hints(self, stderr):
+        """Read stderr from the persistent palette process.
+        Handles the __ready__ signal and live hints (hover, tap)."""
+        for raw in stderr:
+            line = raw.decode().strip()
+            if not line:
+                continue
+            if line == "__ready__":
+                self._palette_ready = True
+                print("[palette proc] ready", flush=True)
+                continue
+            try:
+                msg = json.loads(line)
+                if msg.get("action") == "tap":
+                    actions.tap(msg["cx"], msg["cy"])
+                else:
+                    bounds = msg.get("hover")
+                    if bounds:
+                        s = self.scale
+                        x1, y1, x2, y2 = bounds
+                        self._hier_highlight = (
+                            int(x1 * s), int(y1 * s), int(x2 * s), int(y2 * s)
+                        )
+                    else:
+                        self._hier_highlight = None
+            except Exception:
+                print(f"[palette stderr] {line}", flush=True)
+
+    def _read_persistent_results(self, stdout):
+        """Read results line-by-line from the persistent palette process."""
+        for raw in stdout:
+            try:
+                result = json.loads(raw.decode().strip())
+                self._hier_highlight = None
+                if result:
+                    self._palette_result_q.put(result)
+            except Exception:
+                pass
 
     def _on_palette_action(self, result):
         t = result.get('type')
@@ -434,6 +516,7 @@ class KeyTap:
         save_defaults()
         self._load_deeplinks()
         threading.Thread(target=self._fetch_packages, daemon=True).start()
+        self._preload_palette()
         self.capture.start()
 
         running = True
@@ -460,6 +543,7 @@ class KeyTap:
             # Process palette subprocess results
             try:
                 result = self._palette_result_q.get_nowait()
+                print(f"[palette] result received: {result}", flush=True)
                 if result:
                     self._on_palette_action(result)
             except queue.Empty:

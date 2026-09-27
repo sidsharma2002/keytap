@@ -34,7 +34,8 @@ def parse_args():
     p.add_argument("--rows",   type=int,      default=_disp.get("rows", 32))
     p.add_argument("--height", type=int,      default=_disp.get("height", 800),
                    help="mirror window height px")
-    return p.parse_args()
+    args, _ = p.parse_known_args()
+    return args
 
 
 ARGS = parse_args()

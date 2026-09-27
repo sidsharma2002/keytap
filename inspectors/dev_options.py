@@ -1,3 +1,6 @@
+import sys
+import time as _time
+
 from utils import adb_shell
 
 # type="toggle"  — binary ON/OFF via settings put
@@ -171,11 +174,14 @@ _BY_LABEL = {o["label"]: o for o in _OPTIONS}
 
 def _is_enabled(opt, serial):
     t = opt.get("type", "toggle")
+    _t0 = _time.time()
     if t == "setprop":
         raw = adb_shell(f"getprop {opt['prop']}", serial).strip()
+        print(f"[DEBUG][dev_options] getprop {opt['prop']} -> {repr(raw)} ({_time.time()-_t0:.2f}s)", file=sys.stderr, flush=True)
         return raw == opt["on_val"]
     # toggle (settings-based)
     raw = adb_shell(f"settings get {opt['read_ns']} {opt['read_key']}", serial).strip()
+    print(f"[DEBUG][dev_options] settings get {opt['read_ns']} {opt['read_key']} -> {repr(raw)} ({_time.time()-_t0:.2f}s)", file=sys.stderr, flush=True)
     if raw in ("", "null"):
         return opt.get("default_on", False)
     if opt["id"] == "animations":
@@ -188,6 +194,8 @@ def _is_enabled(opt, serial):
 
 def fetch(serial=None):
     """Return [(label, state_str)] for all options."""
+    _t0 = _time.time()
+    print(f"[DEBUG][dev_options] fetch start, {len(_OPTIONS)} options", file=sys.stderr, flush=True)
     items = []
     for opt in _OPTIONS:
         t = opt.get("type", "toggle")
@@ -199,6 +207,7 @@ def fetch(serial=None):
         else:
             state = "ON" if _is_enabled(opt, serial) else "OFF"
         items.append((opt["label"], state))
+    print(f"[DEBUG][dev_options] fetch done in {_time.time()-_t0:.2f}s", file=sys.stderr, flush=True)
     return items
 
 

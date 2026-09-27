@@ -1,4 +1,6 @@
 import subprocess
+import sys
+import time as _time
 import xml.etree.ElementTree as ET
 
 try:
@@ -43,20 +45,32 @@ def _collect_flat(node, out):
         _collect_flat(child, out)
 
 
-def dump_hierarchy_tree(serial=None):
+def dump_hierarchy_tree(serial=None, u2_dev=None):
     """Return (root_dict, flat_node_list). Uses u2 if available, else adb uiautomator dump."""
+    _t0 = _time.time()
+    print(f"[DEBUG][hierarchy] dump_hierarchy_tree start, HAS_U2={HAS_U2}, serial={serial!r}, preconnected={u2_dev is not None}", file=sys.stderr, flush=True)
     if HAS_U2:
-        d = u2.connect(serial) if serial else u2.connect()
-        xml_raw = d.dump_hierarchy()
+        if u2_dev is None:
+            print(f"[DEBUG][hierarchy] u2.connect() ...", file=sys.stderr, flush=True)
+            u2_dev = u2.connect(serial) if serial else u2.connect()
+            print(f"[DEBUG][hierarchy] u2.connect() done in {_time.time()-_t0:.2f}s", file=sys.stderr, flush=True)
+        else:
+            print(f"[DEBUG][hierarchy] using pre-connected u2 device", file=sys.stderr, flush=True)
+        _t1 = _time.time()
+        xml_raw = u2_dev.dump_hierarchy()
+        print(f"[DEBUG][hierarchy] dump_hierarchy() done in {_time.time()-_t1:.2f}s, total {_time.time()-_t0:.2f}s", file=sys.stderr, flush=True)
         xml_str = xml_raw if isinstance(xml_raw, str) else xml_raw.decode()
     else:
         cmd = ['adb']
         if serial:
             cmd += ['-s', serial]
         cmd += ['shell', 'uiautomator', 'dump', '/dev/stdout']
+        print(f"[DEBUG][hierarchy] adb uiautomator dump ...", file=sys.stderr, flush=True)
         result = subprocess.run(cmd, capture_output=True, timeout=15)
+        print(f"[DEBUG][hierarchy] adb dump done in {_time.time()-_t0:.2f}s, stdout_len={len(result.stdout)}", file=sys.stderr, flush=True)
         xml_str = result.stdout.decode(errors='replace').strip()
 
+    _tp = _time.time()
     root_el = ET.fromstring(xml_str)
     if root_el.tag == 'hierarchy':
         children = list(root_el)
@@ -74,4 +88,5 @@ def dump_hierarchy_tree(serial=None):
 
     flat = []
     _collect_flat(root_node, flat)
+    print(f"[DEBUG][hierarchy] parse+flatten done in {_time.time()-_tp:.2f}s, {len(flat)} nodes, total {_time.time()-_t0:.2f}s", file=sys.stderr, flush=True)
     return root_node, flat
