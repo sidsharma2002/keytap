@@ -24,6 +24,7 @@ from pathlib import Path
 
 import av
 import numpy as np
+from av.video.reformatter import Interpolation
 
 from config import ARGS, ADB_PATH
 from settings import section as _s
@@ -291,10 +292,12 @@ class ScrcpyCaptureManager:
                 # decode() returns list of AVFrames (YUV420p)
                 for frame in codec.decode(packet):
                     # swscale: YUV420p → rgb24 at display resolution
+                    # LANCZOS: best quality for downscaling (vs default BILINEAR)
                     rgb_frame = frame.reformat(
                         width=self.win_w,
                         height=self.win_h,
                         format="rgb24",
+                        interpolation=Interpolation.LANCZOS,
                     )
                     # shape (H, W, 3), C-contiguous → tobytes() = exact frame_bytes
                     self._enqueue(rgb_frame.to_ndarray().tobytes())
@@ -314,7 +317,8 @@ class ScrcpyCaptureManager:
         try:
             for frame in codec.decode(None):
                 rgb_frame = frame.reformat(
-                    width=self.win_w, height=self.win_h, format="rgb24"
+                    width=self.win_w, height=self.win_h, format="rgb24",
+                    interpolation=Interpolation.LANCZOS,
                 )
                 self._enqueue(rgb_frame.to_ndarray().tobytes())
                 frame_count += 1

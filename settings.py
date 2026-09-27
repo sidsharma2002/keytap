@@ -39,7 +39,7 @@ _DEFAULTS = {
     },
     # Capture pipeline
     "capture": {
-        "bitrate":        "8000000",
+        "bitrate":        "20000000",
         "low_latency":    False,
         "fps_cap":        0,        # 0 = no cap (native device fps)
         "encode_scale":   1.0,      # screenrecord --size scale vs native resolution
