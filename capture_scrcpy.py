@@ -157,9 +157,14 @@ class ScrcpyCaptureManager:
             return False
         return True
 
-    def _forward_port(self):
+    def _setup_reverse(self):
+        """Remove any stale forward; set adb reverse so device abstract socket
+        maps to our local TCP port (server connects out to localabstract:scrcpy
+        → forwarded here)."""
+        subprocess.run(self._adb() + ["forward", "--remove", f"tcp:{SCRCPY_PORT}"],
+                       capture_output=True)
         subprocess.run(
-            self._adb() + ["forward", f"tcp:{SCRCPY_PORT}", "localabstract:scrcpy"],
+            self._adb() + ["reverse", "localabstract:scrcpy", f"tcp:{SCRCPY_PORT}"],
             capture_output=True
         )
 
@@ -170,7 +175,7 @@ class ScrcpyCaptureManager:
             f"CLASSPATH={SCRCPY_DEVICE_PATH}",
             "app_process", "/",
             "com.genymobile.scrcpy.Server", SCRCPY_VERSION,
-            "tunnel_forward=true",
+            # no tunnel_forward → server connects OUT to us (reverse tunnel)
             "audio=false",
             "control=false",
             "cleanup=false",
@@ -213,27 +218,37 @@ class ScrcpyCaptureManager:
     def _scrcpy_session(self):
         frame_bytes = self.win_w * self.win_h * 3  # RGB24
 
-        self._forward_port()
+        # Reverse tunnel: Python listens, device server connects to us.
+        # No abstract socket on device — no stale-socket conflicts.
+        self._setup_reverse()  # removes stale forward, sets up adb reverse
+
+        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            server_sock.bind(("127.0.0.1", SCRCPY_PORT))
+            server_sock.listen(1)
+        except OSError as e:
+            self._on_status(f"scrcpy: port {SCRCPY_PORT} busy: {e}")
+            server_sock.close()
+            return False
+
         self._start_server()
 
-        # Wait for server to start listening
-        time.sleep(0.4)
-
-        # Connect socket with retries
-        sock = None
-        for _ in range(10):
-            try:
-                sock = socket.create_connection(("127.0.0.1", SCRCPY_PORT), timeout=1.0)
-                sock.settimeout(None)
-                break
-            except (ConnectionRefusedError, OSError):
-                time.sleep(0.2)
-
-        if sock is None:
-            self._on_status("scrcpy: could not connect to server")
+        # Wait for server to connect (5s timeout)
+        server_sock.settimeout(5.0)
+        try:
+            conn, _ = server_sock.accept()
+        except socket.timeout:
+            self._on_status("scrcpy: server did not connect in time")
             self._kill_server()
+            server_sock.close()
             return False
-        self._sock = sock
+        finally:
+            server_sock.close()
+
+        conn.settimeout(None)
+        self._sock = conn
+        sock = conn
 
         # ffmpeg: reads raw H264 from stdin, outputs RGB24 to stdout
         vf = f"scale={self.win_w}:{self.win_h}"
