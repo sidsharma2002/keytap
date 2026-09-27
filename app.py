@@ -568,14 +568,17 @@ class KeyTap:
                         running = False
 
             # Drain all queued frames, keep only the latest to stay in sync
-            pil_frame = None
+            raw_frame = None
             try:
                 while True:
-                    pil_frame = self.capture.frame_q.get_nowait()
+                    raw_frame = self.capture.frame_q.get_nowait()
             except queue.Empty:
                 pass
-            if pil_frame is not None:
-                self._raw_surf = GridRenderer.pil_to_surface(pil_frame)
+            if raw_frame is not None:
+                # Direct bytes -> Surface: skips PIL tobytes() copy, ~2-10ms faster per frame
+                self._raw_surf = pygame.image.frombytes(
+                    raw_frame, (self.capture.win_w, self.capture.win_h), 'RGB'
+                )
                 self._idle_status()
                 if self.elements.active and not self.elements.loading:
                     if self.elements.check_screen_change(self._raw_surf):

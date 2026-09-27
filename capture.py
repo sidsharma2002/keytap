@@ -11,10 +11,11 @@ from settings import section as _s
 
 
 class CaptureManager:
-    """h264 pipe capture: screenrecord -> ffmpeg -> PIL frames.
+    """h264 pipe capture: screenrecord -> ffmpeg -> raw RGB24 bytes.
 
     Falls back to per-frame screencap if ffmpeg is missing.
-    frame_q always contains PIL RGB Images sized (win_w, win_h).
+    frame_q always contains raw bytes (RGB24, win_w * win_h * 3).
+    Callers convert to pygame Surface with pygame.image.frombytes().
     """
 
     def __init__(self, win_w, win_h, on_status):
@@ -97,8 +98,9 @@ class CaptureManager:
         ]
         ffmpeg_cmd = ["ffmpeg", "-loglevel", "quiet", "-hwaccel", "videotoolbox"]
         if self.low_latency:
-            ffmpeg_cmd += ["-flags", "low_delay", "-fflags", "nobuffer",
-                           "-probesize", "32", "-analyzeduration", "0"]
+            ffmpeg_cmd += ["-flags", "low_delay", "-fflags", "nobuffer+discardcorrupt",
+                           "-probesize", "2048", "-analyzeduration", "100000",
+                           "-avioflags", "direct"]
         ffmpeg_cmd += [
             "-i", "pipe:0",
             "-vf", f"scale={self.win_w}:{self.win_h}",
@@ -136,8 +138,7 @@ class CaptureManager:
                         self._on_status("stream ended - restarting...")
                     return frame_count > 10  # considered successful if we got frames
 
-                frame = Image.frombuffer("RGB", (self.win_w, self.win_h), data)
-                self._enqueue(frame)
+                self._enqueue(data)
                 frame_count += 1
 
                 if first_frame:
@@ -165,9 +166,8 @@ class CaptureManager:
             try:
                 png = take_screencap()
                 if png and len(png) > 512:
-                    img = Image.open(io.BytesIO(png))
-                    frame = img.resize((self.win_w, self.win_h), Image.BILINEAR)
-                    self._enqueue(frame)
+                    img = Image.open(io.BytesIO(png)).resize((self.win_w, self.win_h), Image.BILINEAR).convert('RGB')
+                    self._enqueue(img.tobytes())
                 else:
                     time.sleep(0.5)
             except Exception as e:
