@@ -427,11 +427,12 @@ class PaletteWindow:
         import concurrent.futures
         import time as _t
         _t0 = _t.time()
-        print(f"[DEBUG][hierarchy] fetch start, u2 preconnected={_u2_dev is not None}", file=sys.stderr, flush=True)
+        dev = _get_u2_dev(self._serial)
+        print(f"[DEBUG][hierarchy] fetch start, u2 preconnected={dev is not None}", file=sys.stderr, flush=True)
         try:
             from inspectors.hierarchy import dump_hierarchy_tree
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                fut = ex.submit(dump_hierarchy_tree, self._serial, _u2_dev)
+                fut = ex.submit(dump_hierarchy_tree, self._serial, dev)
                 root_node, flat_nodes = fut.result(timeout=self._FETCH_TIMEOUT)
             _elapsed = _t.time() - _t0
             print(f"[DEBUG][hierarchy] fetch done in {_elapsed:.2f}s, {len(flat_nodes)} nodes", file=sys.stderr, flush=True)
@@ -844,18 +845,33 @@ class ViewerWindow:
 
 # ── Persistent mode ───────────────────────────────────────────────────────────
 
-_u2_dev = None  # pre-connected uiautomator2 device, or None
+_u2_dev = None  # cached uiautomator2 device
+_u2_lock = threading.Lock()
+
+
+def _get_u2_dev(serial):
+    """Return a live u2 device, reconnecting if the cached one is stale."""
+    global _u2_dev
+    with _u2_lock:
+        if _u2_dev is not None:
+            try:
+                _u2_dev.info  # lightweight health-check (HTTP ping to ATX agent)
+                return _u2_dev
+            except Exception:
+                print("[DEBUG][palette_proc] u2 device stale, reconnecting...", file=sys.stderr, flush=True)
+                _u2_dev = None
+        try:
+            import uiautomator2 as u2
+            _u2_dev = u2.connect(serial) if serial else u2.connect()
+            print(f"[DEBUG][palette_proc] u2 connected, serial={serial!r}", file=sys.stderr, flush=True)
+            return _u2_dev
+        except Exception as e:
+            print(f"[DEBUG][palette_proc] u2 connect failed: {e}", file=sys.stderr, flush=True)
+            return None
 
 
 def _preconnect_u2(serial):
-    global _u2_dev
-    try:
-        import uiautomator2 as u2
-        print(f"[DEBUG][palette_proc] pre-connecting u2, serial={serial!r}", file=sys.stderr, flush=True)
-        _u2_dev = u2.connect(serial) if serial else u2.connect()
-        print(f"[DEBUG][palette_proc] u2 pre-connect done", file=sys.stderr, flush=True)
-    except Exception as e:
-        print(f"[DEBUG][palette_proc] u2 pre-connect failed: {e}", file=sys.stderr, flush=True)
+    _get_u2_dev(serial)  # warms the cache; result stored in _u2_dev by _get_u2_dev
 
 
 def _persistent_main():
