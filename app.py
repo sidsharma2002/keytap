@@ -346,8 +346,8 @@ class KeyTap:
             actions.launch_deeplink(url, on_status=self._set_status)
             self._add_deeplink(url)
 
-        elif t == 'memory':
-            self._set_status("memory watchdog: open terminal and run memory inspector")
+        elif t == 'theme-changed':
+            self._set_status(f"theme set to {result.get('theme', '?')} – reopen palette to apply")
 
         elif t == 'app-action':
             self._dispatch_app_action(result['pkg'], result['action'])

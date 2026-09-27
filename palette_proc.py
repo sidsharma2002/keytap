@@ -33,7 +33,11 @@ import threading
 import tkinter as tk
 import tkinter.filedialog as filedialog
 
-# ── Colors ────────────────────────────────────────────────────────────────────
+# ── Feature flags ─────────────────────────────────────────────────────────────
+
+SHOW_MEMORY = False   # disabled until memory inspector is fully implemented
+
+# ── Colors (defaults; overridden by active theme at PaletteWindow init) ────────
 
 C = {
     'bg':      '#1c1c1e',
@@ -52,11 +56,12 @@ FONT_SMALL = ("Menlo", 11)
 # ── Built-in commands ─────────────────────────────────────────────────────────
 
 BUILT_IN = [
-    ("  View Hierarchy    – browse UI tree",    "view-hierarchy"),
-    ("  Memory Watchdog   – live RAM stats",    "memory"),
-    ("  Input Text        – send to device",    "input-text"),
-    ("  Dev Options       – toggle ADB settings","dev-options"),
-    ("  Install APK       – install from file", "install-apk"),
+    ("  View Hierarchy    – browse UI tree",      "view-hierarchy"),
+    *([("  Memory Watchdog   – live RAM stats",   "memory")] if SHOW_MEMORY else []),
+    ("  Input Text        – send to device",      "input-text"),
+    ("  Dev Options       – toggle ADB settings", "dev-options"),
+    ("  Install APK       – install from file",   "install-apk"),
+    ("  Theme             – switch color theme",  "theme-switcher"),
 ]
 
 APP_ACTIONS = [
@@ -88,9 +93,28 @@ class PaletteWindow:
         self._adb_path = data.get("adb_path", "adb")
         self._serial   = data.get("serial") or None
 
+        # Apply active theme to C before building UI
+        try:
+            import theme_manager
+            t = theme_manager.get_active_theme()
+            C.update({
+                'bg':     t['bg'],
+                'bg2':    t['bg_input'],
+                'fg':     t['fg'],
+                'dim':    t['fg_dim'],
+                'accent': t['accent'],
+                'sel':    t['sel_bg'],
+                'sel_fg': t['accent'],
+                'border': t['grid_line'],
+            })
+        except Exception:
+            pass
+
         # viewer state
-        self._viewer_all   = []
-        self._viewer_shown = []
+        self._viewer_all        = []
+        self._viewer_shown      = []
+        self._viewer_fetch_type = None   # tracks active inspector type
+        self._viewer_raw_items  = []     # raw (label, state) for dev-options / theme names
 
         # hierarchy state
         self._hier_nav_stack     = []   # [(nodes, label), ...]
@@ -277,6 +301,8 @@ class PaletteWindow:
                 self._enter_viewer("dev-options")
             elif vtype == "install-apk":
                 self._pick_and_emit_apk()
+            elif vtype == "theme-switcher":
+                self._enter_themes()
             else:
                 self._emit({"type": vtype})
         elif self.state == "actions":
@@ -287,6 +313,11 @@ class PaletteWindow:
                 self._enter_viewer(vtype, pkg=self.sel_pkg)
             else:
                 self._emit({"type": "app-action", "pkg": self.sel_pkg, "action": vtype})
+        elif self.state == "viewer":
+            if self._viewer_fetch_type == "dev-options":
+                self._toggle_dev_option(idx)
+            elif self._viewer_fetch_type == "themes":
+                self._apply_theme(idx)
         elif self.state == "input":
             text = self._var.get().strip()
             if text:
@@ -495,14 +526,15 @@ class PaletteWindow:
     def _enter_viewer(self, fetch_type, pkg=None):
         short = pkg.split(".")[-1] if pkg else ""
         display = {
-            "view-hierarchy": "View Hierarchy",
-            "shared-prefs":   f"Shared Prefs – {short}",
-            "remote-config":  f"Remote Config – {short}",
-            "litmus":         f"Litmus – {short}",
-            "permissions":    f"Permissions – {short}",
-            "dev-options":    "Dev Options",
+            "shared-prefs":  f"Shared Prefs – {short}",
+            "remote-config": f"Remote Config – {short}",
+            "litmus":        f"Litmus – {short}",
+            "permissions":   f"Permissions – {short}",
+            "dev-options":   "Dev Options",
         }.get(fetch_type, fetch_type)
         self.state = "viewer"
+        self._viewer_fetch_type = fetch_type
+        self._viewer_raw_items  = []
         self._var.set("")
         self._prompt.config(text=f"{display}  >")
         self._lb.delete(0, "end")
@@ -513,45 +545,64 @@ class PaletteWindow:
         ).start()
 
     def _bg_fetch_viewer(self, fetch_type, pkg=None):
+        raw_items = []
         try:
             if fetch_type == "shared-prefs":
                 from inspectors import shared_prefs as _m
-                items = _m.fetch(pkg)
+                raw_items = _m.fetch(pkg)
                 label = f"Shared Prefs – {pkg}"
             elif fetch_type == "remote-config":
                 from inspectors import remote_config as _m
-                items = _m.fetch(pkg)
+                raw_items = _m.fetch(pkg)
                 label = f"Remote Config – {pkg}"
             elif fetch_type == "litmus":
                 from inspectors import litmus as _m
-                items, _ = _m.fetch(pkg)
+                raw_items, _ = _m.fetch(pkg)
                 label = f"Litmus – {pkg}"
             elif fetch_type == "permissions":
                 from inspectors import permissions as _m
-                items = _m.fetch(pkg)
+                raw_items = _m.fetch(pkg)
                 label = f"Permissions – {pkg}"
             elif fetch_type == "dev-options":
                 from inspectors import dev_options as _m
-                items = _m.fetch(self._serial)
+                raw_items = _m.fetch(self._serial)
                 label = "Dev Options"
             else:
-                items = [f"  (unsupported: {fetch_type})"]
+                raw_items = [("?", f"unsupported: {fetch_type}")]
                 label = fetch_type
         except Exception as e:
-            items = [f"  error: {e}"]
+            raw_items = [("error", str(e))]
             label = fetch_type
-        self.root.after(0, lambda: self._show_viewer_items(label, items))
 
-    def _show_viewer_items(self, title, items):
-        self._viewer_all   = items
-        self._viewer_shown = items
+        # Format tuples as display strings
+        if fetch_type == "dev-options":
+            items = [f"  {k}  [{v}]" for k, v in raw_items]
+        else:
+            items = []
+            for it in raw_items:
+                if isinstance(it, (list, tuple)) and len(it) == 2:
+                    items.append(f"  {it[0]}  =  {it[1]}")
+                else:
+                    items.append(f"  {it}")
+
+        self.root.after(0, lambda ri=raw_items, lbl=label, its=items:
+                        self._show_viewer_items(lbl, its, ri))
+
+    def _show_viewer_items(self, title, items, raw_items=None):
+        self._viewer_all       = list(items)
+        self._viewer_shown     = list(items)
+        self._viewer_raw_items = list(raw_items) if raw_items else []
         self._prompt.config(text=f"{title}  >")
         self._lb.delete(0, "end")
         for line in items:
             self._lb.insert("end", line)
+        hint = "Enter=toggle  " if self._viewer_fetch_type == "dev-options" else ""
         self._footer.config(
-            text=f"{len(items)} items  |  ↑↓=move  Esc=back to search"
+            text=f"{len(items)} items  |  ↑↓=move  {hint}Esc=back"
         )
+        if items:
+            self._lb.selection_set(0)
+            self._lb.activate(0)
 
     def _refresh_viewer(self):
         q = self._var.get().lower()
@@ -562,6 +613,72 @@ class PaletteWindow:
         self._footer.config(
             text=f"{len(self._viewer_shown)} items  |  ↑↓=move  Esc=back to search"
         )
+
+    # ── Dev options toggle ────────────────────────────────────────────────────
+
+    def _toggle_dev_option(self, idx):
+        if idx >= len(self._viewer_raw_items):
+            return
+        label, _ = self._viewer_raw_items[idx]
+        self._lb.delete(idx)
+        self._lb.insert(idx, f"  {label}  [...]")
+        self._lb.selection_set(idx)
+        self._lb.activate(idx)
+        serial = self._serial
+        def _do():
+            try:
+                from inspectors import dev_options as _m
+                new_state = _m.toggle_by_label(label, serial)
+            except Exception as e:
+                new_state = f"err: {e}"
+            self._viewer_raw_items[idx] = (label, new_state)
+            display = f"  {label}  [{new_state}]"
+            if idx < len(self._viewer_all):
+                self._viewer_all[idx] = display
+            self.root.after(0, lambda: self._update_lb_item(idx, display))
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _update_lb_item(self, idx, text):
+        self._lb.delete(idx)
+        self._lb.insert(idx, text)
+        self._lb.selection_set(idx)
+        self._lb.activate(idx)
+
+    # ── Theme switcher ────────────────────────────────────────────────────────
+
+    def _enter_themes(self):
+        self.state = "viewer"
+        self._viewer_fetch_type = "themes"
+        self._var.set("")
+        self._prompt.config(text="Theme  >")
+        try:
+            import theme_manager
+            themes = theme_manager.list_themes()
+            active = theme_manager.active_name()
+        except Exception:
+            themes = []
+            active = ""
+        self._viewer_raw_items = themes
+        self._viewer_all   = [f"  {'* ' if t == active else '  '}{t}" for t in themes]
+        self._viewer_shown = list(self._viewer_all)
+        self._lb.delete(0, "end")
+        for line in self._viewer_all:
+            self._lb.insert("end", line)
+        self._footer.config(text=f"{len(themes)} themes  |  Enter=apply  Esc=back")
+        if themes:
+            self._lb.selection_set(0)
+            self._lb.activate(0)
+
+    def _apply_theme(self, idx):
+        if idx >= len(self._viewer_raw_items):
+            return
+        name = self._viewer_raw_items[idx]
+        try:
+            import theme_manager
+            theme_manager.set_theme(name)
+        except Exception:
+            pass
+        self._emit({"type": "theme-changed", "theme": name})
 
     # ── Emit ──────────────────────────────────────────────────────────────────
 
