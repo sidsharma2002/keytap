@@ -392,8 +392,7 @@ class KeyTap:
             try:
                 result = json.loads(raw.decode().strip())
                 self._hier_highlight = None
-                if result:
-                    self._palette_result_q.put(result)
+                self._palette_result_q.put(result)  # enqueue even None (close with no action)
             except Exception:
                 pass
 
