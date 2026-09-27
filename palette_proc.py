@@ -73,10 +73,12 @@ BUILT_IN = [
 ]
 
 _BITRATE_PRESETS = [
-    ("2 Mbps  – lowest lag",    "2000000"),
-    ("4 Mbps  – balanced",      "4000000"),
-    ("8 Mbps  – default",       "8000000"),
-    ("16 Mbps – best quality",  "16000000"),
+    ("2 Mbps  – lowest lag",       "2000000"),
+    ("4 Mbps  – low quality",      "4000000"),
+    ("8 Mbps  – medium quality",   "8000000"),
+    ("16 Mbps – good quality",     "16000000"),
+    ("20 Mbps – default",          "20000000"),
+    ("40 Mbps – maximum quality",  "40000000"),
 ]
 
 _FPS_PRESETS = [
@@ -926,7 +928,7 @@ class PaletteWindow:
         self._var.set("")
         self._prompt.config(text="capture  >")
         self._footer.config(text="Enter=apply  Esc=back")
-        cur_br  = str(self.data.get("capture_bitrate", "8000000"))
+        cur_br  = str(self.data.get("capture_bitrate", "20000000"))
         cur_ll  = bool(self.data.get("capture_low_latency", False))
         cur_fps = int(self.data.get("capture_fps_cap", 0))
         items = []
