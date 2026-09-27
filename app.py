@@ -14,7 +14,7 @@ from capture import CaptureManager
 from grid import GridRenderer
 from palette import CommandPalette
 from elements import LABEL_CHARS
-from inspectors import shared_prefs, remote_config, litmus, permissions
+from inspectors import shared_prefs, remote_config, litmus, permissions, dev_options
 from inspectors.hierarchy import dump_hierarchy_tree
 
 
@@ -441,6 +441,9 @@ class KeyTap:
         if pkg == "__set-theme__":
             self.root.after(150, self._open_palette)
             return
+        if pkg == "__dev-options__":
+            threading.Thread(target=self._fetch_dev_options, daemon=True).start()
+            return
         if pkg == "__view-hierarchy__":
             threading.Thread(target=self._fetch_hierarchy, daemon=True).start()
             return
@@ -503,6 +506,22 @@ class KeyTap:
             threading.Thread(target=lambda p=pkg: self._fetch_permissions(p), daemon=True).start()
 
     # ── Inspector fetchers (delegate to inspectors package) ───────────────────
+
+    def _fetch_dev_options(self):
+        items = dev_options.fetch(ARGS.serial)
+        def on_select(label, _state):
+            self.status(f"toggling {label}...")
+            threading.Thread(target=lambda: self._toggle_dev_option(label), daemon=True).start()
+        self.root.after(0, lambda: self._on_viewer_loaded("Dev Options", items, on_select=on_select))
+
+    def _toggle_dev_option(self, label):
+        dev_options.toggle_by_label(label, ARGS.serial)
+        items = dev_options.fetch(ARGS.serial)
+        self.root.after(0, lambda i=items: self._on_dev_options_refresh(i))
+
+    def _on_dev_options_refresh(self, items):
+        if self._palette and self._palette.win.winfo_exists():
+            self._palette.update_viewer_items(items)
 
     def _fetch_shared_prefs(self, pkg):
         items = shared_prefs.fetch(pkg)

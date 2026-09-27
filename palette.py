@@ -160,6 +160,8 @@ class CommandPalette:
                 self._virtual.append(("  Input Text — type to send to device", "input-text", ""))
             if not ql or ql in "theme":
                 self._virtual.append(("  Theme — switch color theme", "theme-switcher", ""))
+            if not ql or ql in "developer options":
+                self._virtual.append(("  Developer Options — toggle ADB debug settings", "dev-options", ""))
             if ql and ql in "clipboard":
                 preview = (self._clipboard_text[:60].replace('\n', ' ')
                            if self._clipboard_text else "(empty)")
@@ -251,6 +253,9 @@ class CommandPalette:
                     self._mem_enter()
                 elif vtype == "theme-switcher":
                     self._show_theme_picker()
+                elif vtype == "dev-options":
+                    self._enter_loading("Dev Options")
+                    self._on_action("__dev-options__", "")
                 else:
                     self._on_action(f"__{vtype}__", vvalue)
                     self._close()
