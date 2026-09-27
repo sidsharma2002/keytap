@@ -38,4 +38,14 @@ def parse_args():
     return args
 
 
-ARGS = parse_args()
+_ARGS = None
+
+
+def __getattr__(name):
+    """Lazy ARGS: argparse only runs when ARGS is first accessed, not on import."""
+    global _ARGS
+    if name == 'ARGS':
+        if _ARGS is None:
+            _ARGS = parse_args()
+        return _ARGS
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
