@@ -351,6 +351,9 @@ class PaletteWindow:
                 self._emit({"type": "capture-settings", "low_latency": not cur_ll})
             elif vtype == "cap-fps":
                 self._emit({"type": "capture-settings", "fps_cap": vvalue})
+            elif vtype == "cap-stats":
+                cur_sv = bool(self.data.get("capture_stats_visible", False))
+                self._emit({"type": "capture-settings", "stats_visible": not cur_sv})
         elif self.state == "input":
             text = self._var.get().strip()
             if text:
@@ -804,6 +807,10 @@ class PaletteWindow:
         for label, val in _FPS_PRESETS:
             dot = "●" if val == cur_fps else " "
             items.append((f"  {dot}  FPS Cap: {label}", "cap-fps", val))
+        cur_sv = bool(self.data.get("capture_stats_visible", False))
+        dot = "●" if cur_sv else " "
+        sv_str = "ON" if cur_sv else "OFF"
+        items.append((f"  {dot}  Stats Overlay: {sv_str}", "cap-stats", "toggle"))
         self._shown = items
         self._set_items(items)
 

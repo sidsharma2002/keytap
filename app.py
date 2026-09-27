@@ -158,11 +158,6 @@ class KeyTap:
         if sym == pygame.K_ESCAPE:
             return False
 
-        # Stats overlay toggle
-        if sym == pygame.K_F1:
-            self._stats_visible = not self._stats_visible
-            return True
-
         # Double-shift → palette
         if sym in (pygame.K_LSHIFT, pygame.K_RSHIFT):
             now = time.time()
@@ -280,9 +275,10 @@ class KeyTap:
             "deeplinks":          self._deeplinks,
             "serial":             ARGS.serial,
             "adb_path":           ADB_PATH,
-            "capture_bitrate":     self.capture.bitrate,
-            "capture_low_latency": self.capture.low_latency,
-            "capture_fps_cap":     self.capture.fps_cap,
+            "capture_bitrate":      self.capture.bitrate,
+            "capture_low_latency":  self.capture.low_latency,
+            "capture_fps_cap":      self.capture.fps_cap,
+            "capture_stats_visible": self._stats_visible,
         }
         if self._palette_proc and self._palette_ready:
             # Fast path: pre-warmed subprocess already has Python + tkinter loaded.
@@ -446,6 +442,8 @@ class KeyTap:
 
         elif t == 'capture-settings':
             import settings as _settings_mod
+            if 'stats_visible' in result:
+                self._stats_visible = bool(result['stats_visible'])
             updates = {k: result[k] for k in ('bitrate', 'low_latency', 'fps_cap') if k in result}
             if updates:
                 _settings_mod.save_section('capture', updates)
