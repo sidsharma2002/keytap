@@ -1,7 +1,9 @@
-import sys
+import logging
 import time as _time
 
 from utils import adb_shell
+
+_log = logging.getLogger("keytap.dev_options")
 
 # type="toggle"  — binary ON/OFF via settings put
 # type="setprop" — binary ON/OFF via setprop (needs app restart, label ends with *)
@@ -219,7 +221,7 @@ def fetch(serial=None):
     instead of spawning one subprocess per option.
     """
     _t0 = _time.time()
-    print(f"[DEBUG][dev_options] fetch start (batched), {len(_OPTIONS)} options", file=sys.stderr, flush=True)
+    _log.debug("fetch start (batched), %d options", len(_OPTIONS))
 
     cmds = []
     for opt in _OPTIONS:
@@ -238,7 +240,7 @@ def fetch(serial=None):
     items = [(opt["label"], _parse_raw(opt, raw))
              for opt, raw in zip(_OPTIONS, lines)]
 
-    print(f"[DEBUG][dev_options] fetch done in {_time.time()-_t0:.2f}s", file=sys.stderr, flush=True)
+    _log.debug("fetch done in %.2fs", _time.time() - _t0)
     return items
 
 

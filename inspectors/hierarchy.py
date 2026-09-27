@@ -1,7 +1,9 @@
+import logging
 import subprocess
-import sys
 import time as _time
 import xml.etree.ElementTree as ET
+
+_log = logging.getLogger("keytap.hierarchy")
 
 try:
     import uiautomator2 as u2
@@ -48,26 +50,26 @@ def _collect_flat(node, out):
 def dump_hierarchy_tree(serial=None, u2_dev=None):
     """Return (root_dict, flat_node_list). Uses u2 if available, else adb uiautomator dump."""
     _t0 = _time.time()
-    print(f"[DEBUG][hierarchy] dump_hierarchy_tree start, HAS_U2={HAS_U2}, serial={serial!r}, preconnected={u2_dev is not None}", file=sys.stderr, flush=True)
+    _log.debug("dump start HAS_U2=%s serial=%r preconnected=%s", HAS_U2, serial, u2_dev is not None)
     if HAS_U2:
         if u2_dev is None:
-            print(f"[DEBUG][hierarchy] u2.connect() ...", file=sys.stderr, flush=True)
+            _log.debug("u2.connect() ...")
             u2_dev = u2.connect(serial) if serial else u2.connect()
-            print(f"[DEBUG][hierarchy] u2.connect() done in {_time.time()-_t0:.2f}s", file=sys.stderr, flush=True)
+            _log.debug("u2.connect() done in %.2fs", _time.time() - _t0)
         else:
-            print(f"[DEBUG][hierarchy] using pre-connected u2 device", file=sys.stderr, flush=True)
+            _log.debug("using pre-connected u2 device")
         _t1 = _time.time()
         xml_raw = u2_dev.dump_hierarchy()
-        print(f"[DEBUG][hierarchy] dump_hierarchy() done in {_time.time()-_t1:.2f}s, total {_time.time()-_t0:.2f}s", file=sys.stderr, flush=True)
+        _log.debug("dump_hierarchy() done in %.2fs (total %.2fs)", _time.time() - _t1, _time.time() - _t0)
         xml_str = xml_raw if isinstance(xml_raw, str) else xml_raw.decode()
     else:
         cmd = ['adb']
         if serial:
             cmd += ['-s', serial]
         cmd += ['shell', 'uiautomator', 'dump', '/dev/stdout']
-        print(f"[DEBUG][hierarchy] adb uiautomator dump ...", file=sys.stderr, flush=True)
+        _log.debug("adb uiautomator dump ...")
         result = subprocess.run(cmd, capture_output=True, timeout=15)
-        print(f"[DEBUG][hierarchy] adb dump done in {_time.time()-_t0:.2f}s, stdout_len={len(result.stdout)}", file=sys.stderr, flush=True)
+        _log.debug("adb dump done in %.2fs stdout_len=%d", _time.time() - _t0, len(result.stdout))
         xml_str = result.stdout.decode(errors='replace').strip()
 
     _tp = _time.time()
@@ -88,5 +90,5 @@ def dump_hierarchy_tree(serial=None, u2_dev=None):
 
     flat = []
     _collect_flat(root_node, flat)
-    print(f"[DEBUG][hierarchy] parse+flatten done in {_time.time()-_tp:.2f}s, {len(flat)} nodes, total {_time.time()-_t0:.2f}s", file=sys.stderr, flush=True)
+    _log.debug("parse+flatten done in %.2fs, %d nodes (total %.2fs)", _time.time() - _tp, len(flat), _time.time() - _t0)
     return root_node, flat

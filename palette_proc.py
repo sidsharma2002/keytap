@@ -27,11 +27,17 @@ Output JSON:
   {"type": "deeplink",      "value": str}
 """
 import json
+import logging
+import os
 import re
 import sys
 import threading
+import time
 import tkinter as tk
 import tkinter.filedialog as filedialog
+
+_LOG_FILE = os.path.expanduser("~/.keytap_debug.log")
+_log = logging.getLogger("keytap.palette")
 
 # ── Feature flags ─────────────────────────────────────────────────────────────
 
@@ -408,7 +414,7 @@ class PaletteWindow:
     _FETCH_TIMEOUT = 20  # seconds before fetch is considered hung
 
     def _enter_hierarchy_loading(self):
-        print("[DEBUG][palette_proc] _enter_hierarchy_loading called", file=sys.stderr, flush=True)
+        _log.debug("_enter_hierarchy_loading called")
         self.state = "hierarchy"
         self._hier_nav_stack = []
         self._hier_current_nodes = []
@@ -420,7 +426,7 @@ class PaletteWindow:
         self._lb.delete(0, "end")
         self._lb.insert("end", "  loading...")
         self._footer.config(text="fetching UI hierarchy from device...")
-        print("[DEBUG][palette_proc] starting _bg_fetch_hierarchy thread", file=sys.stderr, flush=True)
+        _log.debug("starting _bg_fetch_hierarchy thread")
         threading.Thread(target=self._bg_fetch_hierarchy, daemon=True).start()
 
     def _bg_fetch_hierarchy(self):
@@ -428,22 +434,19 @@ class PaletteWindow:
         import time as _t
         _t0 = _t.time()
         dev = _get_u2_dev(self._serial)
-        print(f"[DEBUG][hierarchy] fetch start, u2 preconnected={dev is not None}", file=sys.stderr, flush=True)
+        _log.debug("hierarchy fetch start, u2 preconnected=%s", dev is not None)
         try:
             from inspectors.hierarchy import dump_hierarchy_tree
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
                 fut = ex.submit(dump_hierarchy_tree, self._serial, dev)
                 root_node, flat_nodes = fut.result(timeout=self._FETCH_TIMEOUT)
-            _elapsed = _t.time() - _t0
-            print(f"[DEBUG][hierarchy] fetch done in {_elapsed:.2f}s, {len(flat_nodes)} nodes", file=sys.stderr, flush=True)
+            _log.debug("hierarchy fetch done in %.2fs, %d nodes", _t.time() - _t0, len(flat_nodes))
             self.root.after(0, lambda: self._show_hierarchy(root_node, flat_nodes))
         except concurrent.futures.TimeoutError:
-            _elapsed = _t.time() - _t0
-            print(f"[DEBUG][hierarchy] fetch timed out after {_elapsed:.2f}s", file=sys.stderr, flush=True)
+            _log.warning("hierarchy fetch timed out after %.2fs", _t.time() - _t0)
             self.root.after(0, lambda: self._show_fetch_error("timed out — device not responding"))
         except Exception as e:
-            _elapsed = _t.time() - _t0
-            print(f"[DEBUG][hierarchy] fetch error after {_elapsed:.2f}s: {e}", file=sys.stderr, flush=True)
+            _log.error("hierarchy fetch error after %.2fs: %s", _t.time() - _t0, e)
             self.root.after(0, lambda: self._show_fetch_error(str(e)))
 
     def _show_hierarchy(self, root_node, flat_nodes):
@@ -559,7 +562,7 @@ class PaletteWindow:
         else:
             self._viewer_on_enter = None
 
-        print(f"[DEBUG][palette_proc] _enter_viewer called: {fetch_type}", file=sys.stderr, flush=True)
+        _log.debug("_enter_viewer called: %s", fetch_type)
         self.state = "viewer"
         self._viewer_raw_items = []
         self._var.set("")
@@ -567,7 +570,7 @@ class PaletteWindow:
         self._lb.delete(0, "end")
         self._lb.insert("end", "  Loading...")
         self._footer.config(text="Loading...  Esc=back")
-        print(f"[DEBUG][palette_proc] starting _bg_fetch_viewer thread: {fetch_type}", file=sys.stderr, flush=True)
+        _log.debug("starting _bg_fetch_viewer thread: %s", fetch_type)
         threading.Thread(
             target=self._bg_fetch_viewer, args=(fetch_type, pkg), daemon=True
         ).start()
@@ -581,7 +584,7 @@ class PaletteWindow:
         import concurrent.futures
         import time as _t
         _t0 = _t.time()
-        print(f"[DEBUG][viewer] fetch start: {fetch_type}", file=sys.stderr, flush=True)
+        _log.debug("viewer fetch start: %s", fetch_type)
         interactive = False
 
         def _do_fetch():
@@ -608,16 +611,13 @@ class PaletteWindow:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
                 fut = ex.submit(_do_fetch)
                 raw_items, label, interactive = fut.result(timeout=self._FETCH_TIMEOUT)
-            _elapsed = _t.time() - _t0
-            print(f"[DEBUG][viewer] fetch done in {_elapsed:.2f}s, {len(raw_items)} items", file=sys.stderr, flush=True)
+            _log.debug("viewer fetch done in %.2fs, %d items", _t.time() - _t0, len(raw_items))
         except concurrent.futures.TimeoutError:
-            _elapsed = _t.time() - _t0
-            print(f"[DEBUG][viewer] fetch timed out after {_elapsed:.2f}s", file=sys.stderr, flush=True)
+            _log.warning("viewer fetch timed out after %.2fs", _t.time() - _t0)
             self.root.after(0, lambda: self._show_fetch_error("timed out — device not responding"))
             return
         except Exception as e:
-            _elapsed = _t.time() - _t0
-            print(f"[DEBUG][viewer] fetch error after {_elapsed:.2f}s: {e}", file=sys.stderr, flush=True)
+            _log.error("viewer fetch error after %.2fs: %s", _t.time() - _t0, e)
             raw_items, label, interactive = [("error", str(e))], fetch_type, False
         # Format tuples as display strings
         bracket = fetch_type == "dev-options"
@@ -858,15 +858,15 @@ def _get_u2_dev(serial):
                 _u2_dev.info  # lightweight health-check (HTTP ping to ATX agent)
                 return _u2_dev
             except Exception:
-                print("[DEBUG][palette_proc] u2 device stale, reconnecting...", file=sys.stderr, flush=True)
+                _log.debug("u2 device stale, reconnecting...")
                 _u2_dev = None
         try:
             import uiautomator2 as u2
             _u2_dev = u2.connect(serial) if serial else u2.connect()
-            print(f"[DEBUG][palette_proc] u2 connected, serial={serial!r}", file=sys.stderr, flush=True)
+            _log.debug("u2 connected, serial=%r", serial)
             return _u2_dev
         except Exception as e:
-            print(f"[DEBUG][palette_proc] u2 connect failed: {e}", file=sys.stderr, flush=True)
+            _log.warning("u2 connect failed: %s", e)
             return None
 
 
@@ -874,10 +874,20 @@ def _preconnect_u2(serial):
     _get_u2_dev(serial)  # warms the cache; result stored in _u2_dev by _get_u2_dev
 
 
+def _setup_logging():
+    logging.basicConfig(
+        filename=_LOG_FILE,
+        level=logging.DEBUG,
+        format="%(asctime)s %(name)-22s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
 def _persistent_main():
     """Keep process alive. On each JSON line from stdin, re-open the palette.
     Python + tkinter are already loaded, so the window appears with no startup lag.
     Results are written line-by-line to stdout; __ready__ signals warm state via stderr."""
+    _setup_logging()
     root = tk.Tk()
     root.withdraw()          # start hidden
     root._persistent = True  # signals _emit() to hide instead of destroy
@@ -920,6 +930,7 @@ def _persistent_main():
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
+    _setup_logging()
     if "--persistent" in sys.argv:
         _persistent_main()
         return

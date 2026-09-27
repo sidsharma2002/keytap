@@ -260,7 +260,6 @@ class KeyTap:
     # ── Palette ───────────────────────────────────────────────────────────────
 
     def _open_palette(self):
-        print(f"[palette] open — proc={self._palette_proc is not None} ready={self._palette_ready} pkgs={len(self._packages)}", flush=True)
         data = {
             "mode":      "palette",
             "packages":  self._packages,
@@ -369,7 +368,6 @@ class KeyTap:
                 continue
             if line == "__ready__":
                 self._palette_ready = True
-                print("[palette proc] ready", flush=True)
                 continue
             try:
                 msg = json.loads(line)
@@ -543,7 +541,6 @@ class KeyTap:
             # Process palette subprocess results
             try:
                 result = self._palette_result_q.get_nowait()
-                print(f"[palette] result received: {result}", flush=True)
                 if result:
                     self._on_palette_action(result)
             except queue.Empty:
