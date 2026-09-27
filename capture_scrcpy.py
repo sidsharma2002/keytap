@@ -5,13 +5,13 @@ Replaces screenrecord with scrcpy-server which hooks SurfaceFlinger
 directly, achieving ~30fps vs screenrecord's 2-10fps.
 
 Protocol (raw_stream=true):
-  scrcpy-server → abstract socket → adb forward → TCP → Python socket
-  Python socket → feed thread → ffmpeg stdin → RGB24 frames → frame_q
+  scrcpy-server → abstract socket → adb reverse → TCP → Python socket
+  Python socket → PyAV in-process H264 decode → YUV frame → RGB24 → frame_q
 
 Same public interface as CaptureManager.
 
 Usage:
-  python app.py --backend scrcpy
+  python keytap.py --backend scrcpy
 """
 
 import socket
@@ -22,7 +22,10 @@ import time
 import urllib.request
 from pathlib import Path
 
-from config import ARGS, ADB_PATH, HAS_FFMPEG
+import av
+import numpy as np
+
+from config import ARGS, ADB_PATH
 from settings import section as _s
 
 
@@ -36,6 +39,9 @@ _DOWNLOAD_URL = (
     f"https://github.com/Genymobile/scrcpy/releases/download/"
     f"v{SCRCPY_VERSION}/scrcpy-server-v{SCRCPY_VERSION}"
 )
+
+# AV_CODEC_FLAG_LOW_DELAY
+_LOW_DELAY_FLAG = 0x00080000
 
 
 class ScrcpyCaptureManager:
@@ -65,9 +71,6 @@ class ScrcpyCaptureManager:
         self._stat_t     = 0.0
 
     def start(self):
-        if not HAS_FFMPEG:
-            self._on_status("ffmpeg missing - scrcpy backend requires ffmpeg")
-            return
         threading.Thread(target=self._scrcpy_loop, daemon=True).start()
 
     def stop(self):
@@ -89,13 +92,13 @@ class ScrcpyCaptureManager:
             args += ["-s", ARGS.serial]
         return args
 
-    def _enqueue(self, frame):
+    def _enqueue(self, frame_bytes):
         try:
             self.frame_q.get_nowait()
             self._stat_drop += 1
         except queue.Empty:
             pass
-        self.frame_q.put(frame)
+        self.frame_q.put(frame_bytes)
         self._stat_prod += 1
         now = time.time()
         if self._stat_t == 0.0:
@@ -138,7 +141,6 @@ class ScrcpyCaptureManager:
             return False
 
     def _push_jar(self):
-        # Skip if device already has matching file size
         check = subprocess.run(
             self._adb() + ["shell", f"stat -c %s {SCRCPY_DEVICE_PATH} 2>/dev/null || echo 0"],
             capture_output=True, text=True
@@ -158,9 +160,7 @@ class ScrcpyCaptureManager:
         return True
 
     def _setup_reverse(self):
-        """Remove any stale forward; set adb reverse so device abstract socket
-        maps to our local TCP port (server connects out to localabstract:scrcpy
-        → forwarded here)."""
+        """Remove stale forward, set adb reverse: device abstract → host TCP."""
         subprocess.run(self._adb() + ["forward", "--remove", f"tcp:{SCRCPY_PORT}"],
                        capture_output=True)
         subprocess.run(
@@ -175,7 +175,6 @@ class ScrcpyCaptureManager:
             f"CLASSPATH={SCRCPY_DEVICE_PATH}",
             "app_process", "/",
             "com.genymobile.scrcpy.Server", SCRCPY_VERSION,
-            # no tunnel_forward → server connects OUT to us (reverse tunnel)
             "audio=false",
             "control=false",
             "cleanup=false",
@@ -216,11 +215,7 @@ class ScrcpyCaptureManager:
                     time.sleep(1)
 
     def _scrcpy_session(self):
-        frame_bytes = self.win_w * self.win_h * 3  # RGB24
-
-        # Reverse tunnel: Python listens, device server connects to us.
-        # No abstract socket on device — no stale-socket conflicts.
-        self._setup_reverse()  # removes stale forward, sets up adb reverse
+        self._setup_reverse()
 
         server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -234,7 +229,6 @@ class ScrcpyCaptureManager:
 
         self._start_server()
 
-        # Wait for server to connect (5s timeout)
         server_sock.settimeout(5.0)
         try:
             conn, _ = server_sock.accept()
@@ -248,80 +242,83 @@ class ScrcpyCaptureManager:
 
         conn.settimeout(None)
         self._sock = conn
-        sock = conn
-
-        # ffmpeg: reads raw H264 from stdin, outputs RGB24 to stdout
-        vf = f"scale={self.win_w}:{self.win_h}"
-        if self.fps_cap > 0:
-            vf += f",fps={self.fps_cap}"
-        ffmpeg_cmd = ["ffmpeg", "-loglevel", "quiet", "-hwaccel", "videotoolbox"]
-        if self.low_latency:
-            ffmpeg_cmd += ["-flags", "low_delay", "-fflags", "nobuffer+discardcorrupt",
-                           "-probesize", "2048", "-analyzeduration", "100000",
-                           "-avioflags", "direct"]
-        ffmpeg_cmd += ["-i", "pipe:0", "-vf", vf, "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
 
         try:
-            ffmpeg_proc = subprocess.Popen(
-                ffmpeg_cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-            )
+            return self._decode_loop(conn)
         except Exception as e:
-            self._on_status(f"ffmpeg start error: {e}")
-            self._kill_server()
-            sock.close()
+            if self._running:
+                self._on_status(f"scrcpy decode error: {e}")
             return False
+        finally:
+            self._kill_server()
 
-        # Feed thread: copy socket bytes → ffmpeg stdin
-        def _feed():
-            try:
-                while self._running:
-                    chunk = sock.recv(65536)
-                    if not chunk:
-                        break
-                    ffmpeg_proc.stdin.write(chunk)
-            except Exception:
-                pass
-            finally:
-                try:
-                    ffmpeg_proc.stdin.close()
-                except Exception:
-                    pass
+    def _decode_loop(self, sock):
+        """
+        In-process H264 decode — mirrors scrcpy's demuxer → decoder pipeline.
 
-        threading.Thread(target=_feed, daemon=True).start()
+        scrcpy C path:
+          socket bytes → sc_demuxer (parse AVPackets) → sc_decoder (avcodec_decode)
+          → AVFrame (YUV420p) → SDL_UpdateYUVTexture (GPU YUV→RGB)
+
+        Our Python path:
+          socket bytes → codec.parse() → codec.decode()
+          → AVFrame (YUV420p) → frame.reformat(rgb24, win_w, win_h) [swscale]
+          → numpy.tobytes() → frame_q
+
+        No subprocess pipe. decode + scale happens in-process via libav.
+        """
+        codec = av.CodecContext.create("h264", "r")
+        # AV_CODEC_FLAG_LOW_DELAY: disable B-frame reordering → frame available immediately
+        codec.flags |= _LOW_DELAY_FLAG
+        codec.open()
 
         t_start     = time.time()
         first_frame = True
         frame_count = 0
 
+        while self._running:
+            chunk = sock.recv(65536)
+            if not chunk:
+                if frame_count > 0:
+                    self._on_status("scrcpy stream ended - restarting...")
+                break
+
+            t0 = time.time()
+
+            # parse() splits raw H264 Annex B bytes into decodable packets
+            packets = codec.parse(chunk)
+            for packet in packets:
+                # decode() returns list of AVFrames (YUV420p)
+                for frame in codec.decode(packet):
+                    # swscale: YUV420p → rgb24 at display resolution
+                    rgb_frame = frame.reformat(
+                        width=self.win_w,
+                        height=self.win_h,
+                        format="rgb24",
+                    )
+                    # shape (H, W, 3), C-contiguous → tobytes() = exact frame_bytes
+                    self._enqueue(rgb_frame.to_ndarray().tobytes())
+                    frame_count += 1
+
+                    if first_frame:
+                        elapsed = time.time() - t_start
+                        self._on_status(f"scrcpy  |  first frame {elapsed:.2f}s")
+                        first_frame = False
+
+            stall_ms = (time.time() - t0) * 1000
+            self.stats["stall_ms"] = round(
+                0.8 * self.stats["stall_ms"] + 0.2 * stall_ms, 1
+            )
+
+        # Flush decoder
         try:
-            while self._running:
-                t0   = time.time()
-                data = ffmpeg_proc.stdout.read(frame_bytes)
-                stall_ms = (time.time() - t0) * 1000
-                self.stats["stall_ms"] = round(
-                    0.8 * self.stats["stall_ms"] + 0.2 * stall_ms, 1
+            for frame in codec.decode(None):
+                rgb_frame = frame.reformat(
+                    width=self.win_w, height=self.win_h, format="rgb24"
                 )
-                if len(data) != frame_bytes:
-                    if frame_count > 0:
-                        self._on_status("scrcpy stream ended - restarting...")
-                    return frame_count > 10
-
-                self._enqueue(data)
+                self._enqueue(rgb_frame.to_ndarray().tobytes())
                 frame_count += 1
-
-                if first_frame:
-                    elapsed = time.time() - t_start
-                    self._on_status(f"scrcpy  |  first frame {elapsed:.2f}s")
-                    first_frame = False
-
-        finally:
-            try:
-                ffmpeg_proc.terminate()
-            except Exception:
-                pass
-            self._kill_server()
+        except Exception:
+            pass
 
         return frame_count > 10
