@@ -446,13 +446,17 @@ class KeyTap:
     def _refocus_window(self):
         """Return OS focus to the pygame window after palette closes."""
         try:
-            subprocess.Popen(
-                ['osascript', '-e',
-                 f'tell application "System Events" to set frontmost of'
-                 f' process id {os.getpid()} to true'],
-            )
+            from AppKit import NSApp
+            NSApp.activateIgnoringOtherApps_(True)
         except Exception:
-            pass
+            try:
+                subprocess.Popen(
+                    ['osascript', '-e',
+                     f'tell application "System Events" to set frontmost of'
+                     f' process id {os.getpid()} to true'],
+                )
+            except Exception:
+                pass
 
     # ── Deeplink history ──────────────────────────────────────────────────────
 
