@@ -130,6 +130,9 @@ class PaletteWindow:
         self._viewer_shown_idx    = []   # _viewer_all index for each listbox row (after filter)
         self._viewer_on_enter     = None # callable(raw_idx) or None for read-only viewers
 
+        # actions state
+        self._action_items       = []   # set by _enter_actions; init here avoids trace race
+
         # hierarchy state
         self._hier_nav_stack     = []   # [(nodes, label), ...]
         self._hier_current_nodes = []
