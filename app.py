@@ -260,6 +260,7 @@ class KeyTap:
     # ── Palette ───────────────────────────────────────────────────────────────
 
     def _open_palette(self):
+        threading.Thread(target=self._fetch_packages, daemon=True).start()
         data = {
             "mode":      "palette",
             "packages":  self._packages,
@@ -554,16 +555,19 @@ class KeyTap:
                     if not self._handle_key(event):
                         running = False
 
-            # Drain one frame from capture
+            # Drain all queued frames, keep only the latest to stay in sync
+            pil_frame = None
             try:
-                pil_frame = self.capture.frame_q.get_nowait()
+                while True:
+                    pil_frame = self.capture.frame_q.get_nowait()
+            except queue.Empty:
+                pass
+            if pil_frame is not None:
                 self._raw_surf = GridRenderer.pil_to_surface(pil_frame)
                 self._idle_status()
                 if self.elements.active and not self.elements.loading:
                     if self.elements.check_screen_change(self._raw_surf):
                         self.elements.enter(ref_surf=self._raw_surf)
-            except queue.Empty:
-                pass
 
             # Process palette subprocess results
             try:

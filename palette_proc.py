@@ -157,7 +157,7 @@ class PaletteWindow:
         root.title("keytap")
         root.geometry(f"{self.W}x{self.H}")
         root.configure(bg=C['bg'])
-        root.resizable(False, False)
+        root.resizable(True, True)
         root.attributes("-topmost", True)
 
         # Search bar frame
