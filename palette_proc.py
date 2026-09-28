@@ -68,14 +68,17 @@ BUILT_IN = [
     ("  Dev Options       – toggle ADB settings", "dev-options"),
     ("  Install APK       – install from file",   "install-apk"),
     ("  Theme             – switch color theme",  "theme-switcher"),
-    ("  Capture Settings  – stream quality",      "capture-settings"),
+    ("  Capture Settings  – stream quality",        "capture-settings"),
+    ("  Action Recorder   – record & replay flows", "action-recorder"),
 ]
 
 _BITRATE_PRESETS = [
-    ("2 Mbps  – lowest lag",    "2000000"),
-    ("4 Mbps  – balanced",      "4000000"),
-    ("8 Mbps  – default",       "8000000"),
-    ("16 Mbps – best quality",  "16000000"),
+    ("2 Mbps  – lowest lag",       "2000000"),
+    ("4 Mbps  – low quality",      "4000000"),
+    ("8 Mbps  – medium quality",   "8000000"),
+    ("16 Mbps – good quality",     "16000000"),
+    ("20 Mbps – default",          "20000000"),
+    ("40 Mbps – maximum quality",  "40000000"),
 ]
 
 _FPS_PRESETS = [
@@ -86,10 +89,10 @@ _FPS_PRESETS = [
 ]
 
 _ENCODE_SCALE_PRESETS = [
-    ("100%  – native (default)",        1.0),
-    ("75%   – smaller I-frames",        0.75),
+    ("100%  – native (default)",         1.0),
+    ("75%   – smaller I-frames",         0.75),
     ("50%   – half res, ~4x less stall", 0.5),
-    ("25%   – thumbnail quality",       0.25),
+    ("25%   – thumbnail quality",        0.25),
 ]
 
 APP_ACTIONS = [
@@ -147,6 +150,12 @@ class PaletteWindow:
         # actions state
         self._action_items       = []   # set by _enter_actions; init here avoids trace race
 
+        # input context: distinguishes what the input state is collecting
+        self._input_context = "input-text"
+
+        # replay: holds selected recording info between viewer transitions
+        self._selected_recording = None
+
         # hierarchy state
         self._hier_nav_stack     = []   # [(nodes, label), ...]
         self._hier_current_nodes = []
@@ -177,6 +186,11 @@ class PaletteWindow:
             self._all_items.append((f"  {pkg}", "pkg", pkg))
 
         self._shown = list(self._all_items)
+
+        # Pin [STOP RECORDING] at top while a recording is active.
+        if data.get("recording_active"):
+            self._all_items.insert(0, ("  [STOP RECORDING]", "stop-recording", None))
+            self._shown = list(self._all_items)
 
         # ── Build UI ──────────────────────────────────────────────────────────
         root.title("keytap")
@@ -336,6 +350,10 @@ class PaletteWindow:
                 self._enter_themes()
             elif vtype == "capture-settings":
                 self._enter_capture_settings()
+            elif vtype == "action-recorder":
+                self._enter_recorder()
+            elif vtype == "stop-recording":
+                self._enter_stop_recording_name()
             else:
                 self._emit({"type": vtype})
         elif self.state == "actions":
@@ -366,7 +384,10 @@ class PaletteWindow:
         elif self.state == "input":
             text = self._var.get().strip()
             if text:
-                self._emit({"type": "input-text", "text": text})
+                if self._input_context == "stop-recording":
+                    self._emit({"type": "stop-recording", "name": text})
+                else:
+                    self._emit({"type": "input-text", "text": text})
         elif self.state == "hierarchy":
             if idx is None or idx >= len(self._hier_shown):
                 return
@@ -444,6 +465,7 @@ class PaletteWindow:
 
     def _enter_input(self):
         self.state = "input"
+        self._input_context = "input-text"
         self._var.set("")
         self._prompt.config(text="text >")
         self._lb.delete(0, "end")
@@ -761,6 +783,109 @@ class PaletteWindow:
             self.root.after(0, lambda: self._update_lb_item(lb_idx, display))
         threading.Thread(target=_do, daemon=True).start()
 
+    # ── Action Recorder ───────────────────────────────────────────────────────
+
+    def _enter_recorder(self):
+        items = [
+            ("  Record          – start a new recording", "record"),
+            ("  Replay          – run a saved recording", "replay"),
+        ]
+        self._viewer_raw_items = [t for _, t in items]
+        self._viewer_all       = [l for l, _ in items]
+        self._viewer_shown_idx = list(range(len(items)))
+        self._viewer_on_enter  = self._on_recorder_action
+        self.state = "viewer"
+        self._var.set("")
+        self._prompt.config(text="Action Recorder  >")
+        self._lb.delete(0, "end")
+        for label, _ in items:
+            self._lb.insert("end", label)
+        self._footer.config(text="Enter=select  Esc=back")
+        self._lb.selection_set(0)
+        self._lb.activate(0)
+
+    def _on_recorder_action(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        action = self._viewer_raw_items[raw_idx]
+        if action == "record":
+            self._emit({"type": "start-recording"})
+        elif action == "replay":
+            self._enter_recorder_replay()
+
+    def _enter_recorder_replay(self):
+        try:
+            from recording import Recording
+            recordings = Recording.list_all()
+        except Exception:
+            recordings = []
+
+        if not recordings:
+            self._viewer_raw_items = []
+            self._viewer_all       = ["  No recordings found"]
+            self._viewer_shown_idx = [0]
+            self._viewer_on_enter  = None
+        else:
+            self._viewer_raw_items = recordings
+            self._viewer_all = [
+                f"  {r['name']}  –  {r['recorded_at'][:16]}  ({r['action_count']} steps)"
+                for r in recordings
+            ]
+            self._viewer_shown_idx = list(range(len(recordings)))
+            self._viewer_on_enter  = self._on_recording_selected
+
+        self.state = "viewer"
+        self._var.set("")
+        self._prompt.config(text="Replay  >")
+        self._lb.delete(0, "end")
+        for line in self._viewer_all:
+            self._lb.insert("end", line)
+        n = len(recordings)
+        self._footer.config(text=f"{n} recordings  |  Enter=select  Esc=back")
+        if self._viewer_all:
+            self._lb.selection_set(0)
+            self._lb.activate(0)
+
+    def _on_recording_selected(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        self._selected_recording = self._viewer_raw_items[raw_idx]
+        modes = [
+            ("  Timed  – replay at original speed", "timed"),
+            ("  Fast   – 300ms gap between actions", "fast"),
+            ("  Step   – press Space to advance",    "step"),
+        ]
+        self._viewer_raw_items = [m for _, m in modes]
+        self._viewer_all       = [l for l, _ in modes]
+        self._viewer_shown_idx = list(range(len(modes)))
+        self._viewer_on_enter  = self._on_mode_selected
+        self._var.set("")
+        self._prompt.config(text="Replay mode  >")
+        self._lb.delete(0, "end")
+        for label, _ in modes:
+            self._lb.insert("end", label)
+        self._footer.config(text="Enter=select  Esc=back")
+        self._lb.selection_set(0)
+        self._lb.activate(0)
+
+    def _on_mode_selected(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items) or not self._selected_recording:
+            return
+        mode = self._viewer_raw_items[raw_idx]
+        self._emit({"type": "replay", "path": self._selected_recording["path"], "mode": mode})
+
+    def _enter_stop_recording_name(self):
+        self.state = "input"
+        self._input_context = "stop-recording"
+        self._var.set("")
+        self._prompt.config(text="recording name >")
+        self._lb.delete(0, "end")
+        self._lb.insert("end", "  type a name, then press Enter to save")
+        self._footer.config(text="Enter=save  Esc=cancel")
+
     # ── Theme switcher ────────────────────────────────────────────────────────
 
     def _enter_themes(self):
@@ -803,7 +928,7 @@ class PaletteWindow:
         self._var.set("")
         self._prompt.config(text="capture  >")
         self._footer.config(text="Enter=apply  Esc=back")
-        cur_br  = str(self.data.get("capture_bitrate", "8000000"))
+        cur_br  = str(self.data.get("capture_bitrate", "20000000"))
         cur_ll  = bool(self.data.get("capture_low_latency", False))
         cur_fps = int(self.data.get("capture_fps_cap", 0))
         items = []

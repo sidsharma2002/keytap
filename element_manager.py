@@ -82,7 +82,7 @@ class ElementManager:
             el = next((e for e in self._elements if e['label'] == label), None)
             if el:
                 hint = el['text'] or el['resource_id'] or label
-                self._on_tap(el['cx'], el['cy'], hint)
+                self._on_tap(el['cx'], el['cy'], hint, el)
             else:
                 self._on_status(f"no element '{label}'")
             return True

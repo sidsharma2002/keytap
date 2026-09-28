@@ -13,9 +13,12 @@ import actions
 import fonts
 from adb import adb, get_device_size, list_devices
 from capture import CaptureManager
+from capture_scrcpy import ScrcpyCaptureManager
 from config import ARGS, CURSOR_MODE, CURSOR_JUMP, ADB_PATH
 from element_manager import ElementManager
 from grid import GridRenderer
+from recorder import ActionRecorder
+from replayer import ActionReplayer
 from settings import kb
 
 STATUS_H = 24   # height of status bar below the mirror
@@ -36,8 +39,9 @@ class KeyTap:
         pygame.display.set_caption("keytap")
 
         # ── Components ────────────────────────────────────────────────────────
-        self.capture  = CaptureManager(self.win_w, self.win_h, dev_w, dev_h,
-                                       on_status=self._set_status)
+        CaptureClass  = ScrcpyCaptureManager if ARGS.backend == "scrcpy" else CaptureManager
+        self.capture  = CaptureClass(self.win_w, self.win_h, dev_w, dev_h,
+                                     on_status=self._set_status)
         self.renderer = GridRenderer(self.win_w, self.win_h)
         self.renderer.init_fonts()
 
@@ -74,6 +78,10 @@ class KeyTap:
         self._consumer_frames  = 0
         self._consumer_t       = 0.0
         self._render_ms        = 0.0
+
+        # Action recorder / replayer
+        self.recorder = ActionRecorder()
+        self.replayer = ActionReplayer()
 
         # Status font
         self._status_font = self._try_font(11)
@@ -131,17 +139,29 @@ class KeyTap:
     # ── ADB actions ───────────────────────────────────────────────────────────
 
     def _tap(self, dx, dy):
+        self.recorder.record_tap(dx, dy)
         actions.tap(dx, dy, on_status=self._set_status)
 
     def _keyevent(self, code, label=""):
+        self.recorder.record_keyevent(code, label)
         actions.keyevent(code, label, on_status=self._set_status)
 
     def _scroll(self, direction):
         cx, cy = self._cell_to_dev_rc(self.cursor_row, self.cursor_col)
+        dist = int(self.dev_h * 0.4)
+        half = dist // 2
+        if direction == 'up':
+            self.recorder.record_swipe(cx, max(cy - half, 0), cx, min(cy + half, self.dev_h - 1))
+        else:
+            self.recorder.record_swipe(cx, min(cy + half, self.dev_h - 1), cx, max(cy - half, 0))
         actions.scroll(cx, cy, self.dev_h, direction, on_status=self._set_status)
 
-    def _on_elem_tap(self, cx, cy, hint):
+    def _on_elem_tap(self, cx, cy, hint, element=None):
         self._set_status(f"tap '{hint}' ({cx},{cy})")
+        if element is not None:
+            self.recorder.record_element_tap(element)
+        else:
+            self.recorder.record_tap(cx, cy)
         actions.tap(cx, cy)
 
     # ── Key handling ──────────────────────────────────────────────────────────
@@ -157,6 +177,12 @@ class KeyTap:
         # Quit
         if sym == pygame.K_ESCAPE:
             return False
+
+        # Step-mode replay: Space advances one action
+        if self.replayer.active and self.replayer.mode == "step":
+            if sym == pygame.K_SPACE:
+                self.replayer.advance()
+                return True
 
         # Double-shift → palette
         if sym in (pygame.K_LSHIFT, pygame.K_RSHIFT):
@@ -269,17 +295,18 @@ class KeyTap:
     def _open_palette(self):
         threading.Thread(target=self._fetch_packages, daemon=True).start()
         data = {
-            "mode":               "palette",
-            "packages":           self._packages,
-            "clipboard":          self._read_clipboard(),
-            "deeplinks":          self._deeplinks,
-            "serial":             ARGS.serial,
-            "adb_path":           ADB_PATH,
+            "mode":                  "palette",
+            "packages":              self._packages,
+            "clipboard":             self._read_clipboard(),
+            "deeplinks":             self._deeplinks,
+            "serial":                ARGS.serial,
+            "adb_path":              ADB_PATH,
             "capture_bitrate":       self.capture.bitrate,
             "capture_low_latency":   self.capture.low_latency,
             "capture_fps_cap":       self.capture.fps_cap,
             "capture_encode_scale":  self.capture.encode_scale,
             "capture_stats_visible": self._stats_visible,
+            "recording_active":      self.recorder.active,
         }
         if self._palette_proc and self._palette_ready:
             # Fast path: pre-warmed subprocess already has Python + tkinter loaded.
@@ -424,17 +451,21 @@ class KeyTap:
                 actions.install_apk(path, on_status=self._set_status)
 
         elif t == 'input-text':
-            actions.input_text(result['text'], on_status=self._set_status)
+            text = result['text']
+            self.recorder.record_input_text(text)
+            actions.input_text(text, on_status=self._set_status)
 
         elif t == 'clipboard':
             text = result.get('value', '')
             if text:
+                self.recorder.record_input_text(text)
                 actions.input_text(text, on_status=self._set_status)
             else:
                 self._set_status("clipboard empty")
 
         elif t == 'deeplink':
             url = result.get('value', '')
+            self.recorder.record_launch_deeplink(url)
             actions.launch_deeplink(url, on_status=self._set_status)
             self._add_deeplink(url)
 
@@ -457,9 +488,38 @@ class KeyTap:
         elif t == 'app-action':
             self._dispatch_app_action(result['pkg'], result['action'])
 
+        elif t == 'start-recording':
+            self.recorder.start()
+            self._set_status("recording...  (double-shift -> Stop Recording to save)")
+
+        elif t == 'stop-recording':
+            self.recorder.stop()
+            name = result.get('name', 'recording')
+            try:
+                path = self.recorder.save(name, ARGS.serial, (self.dev_w, self.dev_h))
+                self._set_status(f"saved: {os.path.basename(path)}")
+            except Exception as e:
+                self._set_status(f"save failed: {e}")
+
+        elif t == 'replay':
+            path = result.get('path', '')
+            mode = result.get('mode', 'timed')
+            try:
+                from recording import Recording
+                rec = Recording.load(path)
+                self.replayer.start(
+                    rec, mode, ARGS.serial,
+                    on_status=self._set_status,
+                    on_done=self._on_replay_done,
+                    device_resolution=(self.dev_w, self.dev_h),
+                )
+            except Exception as e:
+                self._set_status(f"replay error: {e}")
+
     def _dispatch_app_action(self, pkg, action):
         self._set_status(f"{action} {pkg}")
         if action == "launch":
+            self.recorder.record_launch(pkg)
             actions.launch(pkg, on_status=self._set_status)
         elif action == "force-stop":
             actions.force_stop(pkg, on_status=self._set_status)
@@ -467,6 +527,12 @@ class KeyTap:
             actions.clear_data(pkg, on_status=self._set_status)
         elif action == "uninstall":
             actions.uninstall(pkg, on_status=self._set_status)
+
+    def _on_replay_done(self, success, step, error):
+        if success:
+            self._set_status(f"replay complete  ({step} actions)")
+        else:
+            self._set_status(f"replay failed at step {step}: {error}")
 
     def _refocus_window(self):
         """Return OS focus to the pygame window after palette closes.
@@ -558,9 +624,28 @@ class KeyTap:
         bar_y = self.win_h
         pygame.draw.rect(self.screen, (26, 26, 26),
                          (0, bar_y, self.win_w, STATUS_H))
-        if self._status_font:
+        if not self._status_font:
+            return
+
+        x = 8
+        text_y = bar_y + (STATUS_H - self._status_font.size("X")[1]) // 2
+
+        if self.recorder.active:
+            blink_on = int(time.time() * 2) % 2 == 0
+            rec_color = (220, 50, 50) if blink_on else (100, 30, 30)
+            rec_surf = self._status_font.render(
+                f"[REC] {self.recorder.action_count}", True, rec_color
+            )
+            sep_surf = self._status_font.render("  |  ", True, (136, 136, 136))
+            main_surf = self._status_font.render(self._status[:90], True, (136, 136, 136))
+            self.screen.blit(rec_surf, (x, text_y))
+            x += rec_surf.get_width()
+            self.screen.blit(sep_surf, (x, text_y))
+            x += sep_surf.get_width()
+            self.screen.blit(main_surf, (x, text_y))
+        else:
             t = self._status_font.render(self._status[:120], True, (136, 136, 136))
-            self.screen.blit(t, (8, bar_y + (STATUS_H - t.get_height()) // 2))
+            self.screen.blit(t, (x, text_y))
 
     def _draw_stats(self):
         s    = self.capture.stats

@@ -52,13 +52,15 @@ def dump_elements(serial=None):
             break
 
         elements.append({
-            'label':       LABELS[len(elements)],
-            'cx':          (x1 + x2) // 2,
-            'cy':          (y1 + y2) // 2,
+            'label':        LABELS[len(elements)],
+            'cx':           (x1 + x2) // 2,
+            'cy':           (y1 + y2) // 2,
             'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
-            'text':        node.get('text', ''),
-            'resource_id': node.get('resource-id', ''),
-            'clickable':   clickable,
+            'text':         node.get('text', ''),
+            'resource_id':  node.get('resource-id', ''),
+            'content_desc': node.get('content-desc', ''),
+            'class_name':   node.get('class', ''),
+            'clickable':    clickable,
         })
 
     return elements

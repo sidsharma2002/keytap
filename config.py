@@ -34,6 +34,8 @@ def parse_args():
     p.add_argument("--rows",   type=int,      default=_disp.get("rows", 32))
     p.add_argument("--height", type=int,      default=_disp.get("height", 800),
                    help="mirror window height px")
+    p.add_argument("--backend", choices=["screenrecord", "scrcpy"], default="scrcpy",
+                   help="capture backend (default: scrcpy)")
     args, _ = p.parse_known_args()
     return args
 
