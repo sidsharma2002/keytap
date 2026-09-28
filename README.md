@@ -32,48 +32,45 @@ Built for mobile developers and QA engineers who want fast, scriptable device co
 
 ---
 
-## Requirements
+## Install
 
-### System tools
-
-```bash
-brew install android-platform-tools scrcpy ffmpeg
-```
-
-On Linux:
-```bash
-sudo apt install adb scrcpy ffmpeg
-```
-
-### Python
+### One-liner (recommended)
 
 ```bash
-pip install Pillow uiautomator2
-python -m uiautomator2 init   # one-time: installs agent APK on device
+curl -fsSL https://raw.githubusercontent.com/sidsharma2002/keytap/development/bootstrap.sh | bash
 ```
+
+Clones the repo to `~/keytap`, installs Python dependencies, and registers the `keytap` command in your shell. Open a new terminal and run:
+
+```bash
+keytap
+```
+
+### Manual
+
+```bash
+git clone https://github.com/sidsharma2002/keytap.git
+cd keytap
+bash install.sh
+```
+
+### System requirements
+
+- **adb** — `brew install android-platform-tools`
+- **ffmpeg** — `brew install ffmpeg` (optional, used by screenrecord fallback)
+- Python 3.10+
 
 ---
 
-## Setup
+## Usage
+
+Connect a device, then:
 
 ```bash
-git clone https://github.com/your-username/keytap.git
-cd keytap
-pip install Pillow uiautomator2
-python -m uiautomator2 init
-```
-
-Connect your device:
-```bash
-adb devices
-```
-
-Run:
-```bash
-python app.py
-
-# target a specific device
-python app.py --serial emulator-5554
+keytap                          # default (scrcpy backend, best fps)
+keytap --serial emulator-5554   # target a specific device
+keytap --height 1000            # taller mirror window
+keytap --backend screenrecord   # fallback capture
 ```
 
 ---
