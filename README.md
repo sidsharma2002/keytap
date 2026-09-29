@@ -17,6 +17,10 @@ Built for mobile developers and QA engineers who want fast, scriptable device co
 - **Layout Inspector** — live bounding box overlay on real UI elements with class, resource ID, and text labels
 - **View Hierarchy Explorer** — browse the full UI tree from the command palette, scroll through nodes, and see live bound highlights on screen as you navigate
 
+### Record & Replay
+- **Action Recorder** — record any sequence of taps, swipes, and text inputs, then replay them precisely on any device
+- **Network Capture** — optionally intercepts HTTP/HTTPS traffic during recording via mitmproxy; replay serves the exact same responses so UI state is reproduced without live network calls
+
 ### Debug
 - **Memory Watchdog** — real-time GC pressure gauge and process death risk indicator for the foreground app, updated every 2s
 - **Shared Prefs Viewer** — browse and search all shared preference keys for any installed package
@@ -59,6 +63,29 @@ bash install.sh
 - **adb** — `brew install android-platform-tools`
 - **ffmpeg** — `brew install ffmpeg` (optional, used by screenrecord fallback)
 - Python 3.10+
+
+### Network capture setup (optional, one-time)
+
+Enables keytap to intercept and replay HTTP/HTTPS traffic during recording. Debug builds only.
+
+1. `install.sh` installs mitmproxy and generates the CA cert at `~/.mitmproxy/mitmproxy-ca-cert.pem` automatically.
+
+2. Push the cert to your device and install it:
+   ```bash
+   adb push ~/.mitmproxy/mitmproxy-ca-cert.pem /sdcard/mitmproxy-ca.pem
+   # On device: Settings > Security > Install certificate > CA certificate
+   ```
+
+3. Your app's `network_security_config.xml` must trust user CAs in debug builds:
+   ```xml
+   <debug-overrides>
+       <trust-anchors>
+           <certificates src="user" />
+       </trust-anchors>
+   </debug-overrides>
+   ```
+
+Once set up, network capture is automatic — keytap intercepts traffic during recording and serves mocked responses during replay. No extra flags needed.
 
 ---
 
