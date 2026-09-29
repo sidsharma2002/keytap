@@ -153,12 +153,11 @@ def _network_events(flows: List[dict]) -> List[dict]:
     """
     events = []
     for flow in flows:
-        req  = flow.get("request", {})
-        resp = flow.get("response", {})
         t_req  = flow.get("t_request_ms")
         t_resp = flow.get("t_response_ms")
-        method = req.get("method", "?")
-        url    = req.get("url", "?")
+        method = flow.get("method", "?")
+        url    = flow.get("url", "?")
+        status = flow.get("response_status")
 
         if t_req is not None:
             events.append({
@@ -173,7 +172,7 @@ def _network_events(flows: List[dict]) -> List[dict]:
                 "type":        "network_res",
                 "method":      method,
                 "url":         url,
-                "status":      resp.get("status_code"),
+                "status":      status,
                 "duration_ms": (t_resp - t_req) if t_req is not None else None,
             })
     return events
