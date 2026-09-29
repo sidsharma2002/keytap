@@ -148,8 +148,8 @@ class TimelineViewer:
         self.root      = root
         self.steps     = []
         self.idx       = 0
-        self._img      = None
-        self._video    = None   # av.Container, kept open for seeking
+        self._img        = None
+        self._video_path = None   # path to screen.mp4; open fresh per seek
 
         root.title("keytap  |  timeline viewer")
         root.configure(bg=BG)
@@ -162,11 +162,6 @@ class TimelineViewer:
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _on_close(self):
-        if self._video:
-            try:
-                self._video.close()
-            except Exception:
-                pass
         self.root.destroy()
 
     # ── UI ────────────────────────────────────────────────────────────────────
@@ -226,11 +221,7 @@ class TimelineViewer:
 
         if video_path:
             if _AV_OK:
-                try:
-                    self._video = av.open(video_path)
-                except Exception as e:
-                    self.lbl_title.configure(text=f"video open failed: {e}")
-                    self._video = None
+                self._video_path = video_path
             else:
                 self.ss_lbl.configure(text="install PyAV to enable video\n(pip install av)")
 
@@ -256,7 +247,7 @@ class TimelineViewer:
         self.lbl_step.configure(text=f"Step {self.idx + 1} / {len(self.steps)}")
 
         # frame
-        if self._video:
+        if self._video_path:
             self._show_video_frame(act.get("t", 0))
         elif act.get("screenshot"):
             self._show_screenshot(os.path.join(self.dir_path, act["screenshot"]))
@@ -283,8 +274,11 @@ class TimelineViewer:
         self.txt.configure(state=tk.DISABLED)
 
     def _show_video_frame(self, t_ms: int):
+        # Open fresh container per seek — avoids stale decoder state
+        container = None
         try:
-            arr, w, h = _frame_at_ms(self._video, t_ms)
+            container = av.open(self._video_path)
+            arr, w, h = _frame_at_ms(container, t_ms)
             if arr is not None:
                 img = _arr_to_photoimage(arr)
                 self._img = img
@@ -292,6 +286,12 @@ class TimelineViewer:
                 return
         except Exception as e:
             pass
+        finally:
+            if container:
+                try:
+                    container.close()
+                except Exception:
+                    pass
         self.ss_lbl.configure(image="", text=f"seek failed @ {t_ms}ms")
         self._img = None
 
