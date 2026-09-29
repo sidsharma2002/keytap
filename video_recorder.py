@@ -62,6 +62,7 @@ class VideoRecorder:
             # ms-precision timestamps so viewer can seek by action.t directly
             self._stream.codec_context.time_base = Fraction(1, 1000)
             self._stream.codec_context.options["preset"] = "ultrafast"
+            self._stream.codec_context.options["g"]      = "60"  # keyframe every 60 frames (~2s) for fast seeking
             self.active = True
             return True
         except Exception:

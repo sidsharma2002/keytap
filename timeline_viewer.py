@@ -65,9 +65,9 @@ def build_steps(events):
 # ── video frame extraction ────────────────────────────────────────────────────
 
 def _frame_at_ms(container, t_ms: int):
-    """Seek to t_ms and return first decoded frame as (numpy array, w, h)."""
+    """Seek to t_ms and decode forward to the correct frame."""
     stream = container.streams.video[0]
-    # Use AV_TIME_BASE (microseconds) — avoids stream time_base guessing
+    t_target_s = t_ms / 1000.0
     try:
         container.seek(t_ms * 1000, backward=True)
     except Exception:
@@ -75,10 +75,16 @@ def _frame_at_ms(container, t_ms: int):
             container.seek(0)
         except Exception:
             pass
+    # backward=True lands on the nearest keyframe before t_ms.
+    # Decode forward until we reach or pass the target timestamp.
+    best = None
     for frame in container.decode(stream):
-        arr = frame.to_ndarray(format="rgb24")
-        return arr, frame.width, frame.height
-    return None, 0, 0
+        best = frame
+        if frame.time >= t_target_s:
+            break
+    if best is None:
+        return None, 0, 0
+    return best.to_ndarray(format="rgb24"), best.width, best.height
 
 
 def _arr_to_photoimage(arr, target_h: int = 560):
