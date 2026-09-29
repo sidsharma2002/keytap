@@ -10,7 +10,7 @@ import threading
 import time
 
 import actions
-from recording import Action, ElementSelector, Recording
+from recording import Action, ElementSelector, Recording, action_label
 
 
 class ActionReplayer:
@@ -21,6 +21,18 @@ class ActionReplayer:
         self.mode = "timed"
         self._stop_event = threading.Event()
         self._step_event = threading.Event()
+        self._on_status = None
+        self._u2_dev = None
+        self._current_step = 0   # 0-indexed; set before _wait_between so overlay reflects waiting step
+        self._recording = None   # Recording being replayed; None when idle
+
+    @property
+    def current_step(self) -> int:
+        return self._current_step
+
+    @property
+    def recording(self):
+        return self._recording
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -28,6 +40,8 @@ class ActionReplayer:
               on_status, on_done, device_resolution=None):
         self.mode = mode
         self.active = True
+        self._recording = recording
+        self._current_step = 0
         self._stop_event.clear()
         self._step_event.clear()
         threading.Thread(
@@ -48,6 +62,7 @@ class ActionReplayer:
     # ── Replay loop ───────────────────────────────────────────────────────────
 
     def _run(self, recording, serial, on_status, on_done, device_resolution):
+        self._on_status = on_status
         total = len(recording.actions)
 
         if device_resolution and recording.device_resolution != list(device_resolution):
@@ -56,25 +71,47 @@ class ActionReplayer:
                 f"device is {list(device_resolution)} — coords may miss"
             )
 
+        # Pre-connect u2 once for the whole replay if element_tap actions exist
+        has_elem_taps = any(a.type == "element_tap" for a in recording.actions)
+        if has_elem_taps:
+            try:
+                import uiautomator2 as u2
+                self._u2_dev = u2.connect(serial) if serial else u2.connect()
+            except Exception:
+                self._u2_dev = None
+        else:
+            self._u2_dev = None
+
         prev_t = 0
         for i, action in enumerate(recording.actions):
             if self._stop_event.is_set():
                 on_status("replay stopped")
                 self.active = False
+                self._recording = None
                 return
 
-            on_status(f"[REPLAY {i + 1}/{total}] {action.type}")
+            self._current_step = i
+            on_status(f"[REPLAY {i + 1}/{total}] {action_label(action)}")
             self._wait_between(action.t, prev_t)
+
+            if self._stop_event.is_set():
+                on_status("replay stopped")
+                self.active = False
+                self._recording = None
+                return
+
             prev_t = action.t
 
             ok, error = self._execute(action, serial)
             if not ok:
                 on_status(f"[REPLAY ERROR] step {i + 1}: {error}")
                 self.active = False
+                self._recording = None
                 on_done(success=False, step=i + 1, error=error)
                 return
 
         self.active = False
+        self._recording = None
         on_status(f"replay done  ({total} actions)")
         on_done(success=True, step=total, error=None)
 
@@ -107,32 +144,49 @@ class ActionReplayer:
             actions.launch_deeplink(action.url)
         elif t == "keyevent":
             actions.keyevent(action.keycode, action.label or "")
+        elif t == "wait":
+            ms = action.duration or 0
+            if ms > 0:
+                time.sleep(ms / 1000)
         else:
             return False, f"unknown action type: {t}"
         return True, None
 
     def _execute_element_tap(self, action: Action, serial: str):
-        try:
-            import uiautomator2 as u2
-            dev = u2.connect(serial) if serial else u2.connect()
-            el = self._find_element(dev, action.selector)
-            if el is not None:
-                cx, cy = el.center()
-                actions.tap(cx, cy)
-                return True, None
-        except Exception as e:
-            # Fall through to fallback if available
+        dev = self._u2_dev
+        if dev is not None:
+            try:
+                el = self._find_element(dev, action.selector)
+                if el is not None:
+                    cx, cy = el.center()
+                    actions.tap(cx, cy)
+                    return True, None
+            except Exception as e:
+                if not action.reliable and action.fallback_coords:
+                    cx, cy = action.fallback_coords
+                    if self._on_status:
+                        self._on_status("[WARN] element lookup error, using fallback_coords")
+                    actions.tap(cx, cy)
+                    return True, None
+                return False, f"element lookup failed: {e}"
+
+            # el is None — element not found in hierarchy
             if not action.reliable and action.fallback_coords:
                 cx, cy = action.fallback_coords
+                sel = action.selector
+                name = sel.resource_id or sel.content_desc or sel.text or "?"
+                if self._on_status:
+                    self._on_status(f"[WARN] element '{name}' not found, using fallback_coords")
                 actions.tap(cx, cy)
                 return True, None
-            return False, f"element lookup failed: {e}"
-
-        # Element not found
-        if not action.reliable and action.fallback_coords:
-            cx, cy = action.fallback_coords
-            actions.tap(cx, cy)
-            return True, None
+        else:
+            # u2 not connected — fall back to coords if possible
+            if not action.reliable and action.fallback_coords:
+                cx, cy = action.fallback_coords
+                if self._on_status:
+                    self._on_status("[WARN] u2 unavailable, using fallback_coords")
+                actions.tap(cx, cy)
+                return True, None
 
         sel = action.selector
         desc = sel.resource_id or sel.content_desc or sel.text or "?"

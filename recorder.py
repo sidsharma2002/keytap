@@ -87,6 +87,10 @@ class ActionRecorder:
                 t=self._ms(), type="keyevent", keycode=keycode, label=label,
             ))
 
+    def record_wait(self, ms: int):
+        if self.active:
+            self._actions.append(Action(t=self._ms(), type="wait", duration=ms))
+
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _ms(self) -> int:

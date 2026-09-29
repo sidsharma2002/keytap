@@ -155,6 +155,7 @@ class PaletteWindow:
 
         # replay: holds selected recording info between viewer transitions
         self._selected_recording = None
+        self._manage_recording   = None
 
         # hierarchy state
         self._hier_nav_stack     = []   # [(nodes, label), ...]
@@ -386,6 +387,12 @@ class PaletteWindow:
             if text:
                 if self._input_context == "stop-recording":
                     self._emit({"type": "stop-recording", "name": text})
+                elif self._input_context == "insert-wait":
+                    try:
+                        ms = int(float(text) * 1000)
+                        self._emit({"type": "insert-wait", "ms": ms})
+                    except ValueError:
+                        pass  # invalid input, stay open
                 else:
                     self._emit({"type": "input-text", "text": text})
         elif self.state == "hierarchy":
@@ -789,7 +796,10 @@ class PaletteWindow:
         items = [
             ("  Record          – start a new recording", "record"),
             ("  Replay          – run a saved recording", "replay"),
+            ("  Manage          – delete / view recordings", "manage"),
         ]
+        if self.data.get("recording_active"):
+            items.insert(0, ("  [Insert Wait]   – add a timed pause to recording", "insert-wait"))
         self._viewer_raw_items = [t for _, t in items]
         self._viewer_all       = [l for l, _ in items]
         self._viewer_shown_idx = list(range(len(items)))
@@ -813,6 +823,10 @@ class PaletteWindow:
             self._emit({"type": "start-recording"})
         elif action == "replay":
             self._enter_recorder_replay()
+        elif action == "manage":
+            self._enter_recorder_manage()
+        elif action == "insert-wait":
+            self._enter_recorder_insert_wait()
 
     def _enter_recorder_replay(self):
         try:
@@ -885,6 +899,109 @@ class PaletteWindow:
         self._lb.delete(0, "end")
         self._lb.insert("end", "  type a name, then press Enter to save")
         self._footer.config(text="Enter=save  Esc=cancel")
+
+    def _enter_recorder_insert_wait(self):
+        self.state = "input"
+        self._input_context = "insert-wait"
+        self._var.set("")
+        self._prompt.config(text="wait (seconds) >")
+        self._lb.delete(0, "end")
+        self._lb.insert("end", "  e.g. 2.5 inserts a 2500ms pause at this point")
+        self._footer.config(text="Enter=insert  Esc=back")
+
+    def _enter_recorder_manage(self):
+        try:
+            from recording import Recording
+            recordings = Recording.list_all()
+        except Exception:
+            recordings = []
+
+        if not recordings:
+            self._viewer_raw_items = []
+            self._viewer_all       = ["  No recordings found"]
+            self._viewer_shown_idx = [0]
+            self._viewer_on_enter  = None
+        else:
+            self._viewer_raw_items = recordings
+            self._viewer_all = [
+                f"  {r['name']}  –  {r['recorded_at'][:16]}  ({r['action_count']} steps)"
+                for r in recordings
+            ]
+            self._viewer_shown_idx = list(range(len(recordings)))
+            self._viewer_on_enter  = self._on_manage_recording_selected
+
+        self.state = "viewer"
+        self._var.set("")
+        self._prompt.config(text="Manage Recordings  >")
+        self._lb.delete(0, "end")
+        for line in self._viewer_all:
+            self._lb.insert("end", line)
+        hint = "Enter=select  " if recordings else ""
+        self._footer.config(text=f"{len(recordings)} recordings  |  {hint}Esc=back")
+        if self._viewer_all:
+            self._lb.selection_set(0)
+            self._lb.activate(0)
+
+    def _on_manage_recording_selected(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        self._manage_recording = self._viewer_raw_items[raw_idx]
+        sub = [
+            ("  View Actions  – preview all steps in this recording", "view-actions"),
+            ("  Delete        – permanently remove this recording",   "delete"),
+        ]
+        self._viewer_raw_items = [a for _, a in sub]
+        self._viewer_all       = [l for l, _ in sub]
+        self._viewer_shown_idx = list(range(len(sub)))
+        self._viewer_on_enter  = self._on_manage_action
+        self._var.set("")
+        name = self._manage_recording.get("name", "?")
+        self._prompt.config(text=f"{name}  >")
+        self._lb.delete(0, "end")
+        for label, _ in sub:
+            self._lb.insert("end", label)
+        self._footer.config(text="Enter=select  Esc=back")
+        self._lb.selection_set(0)
+        self._lb.activate(0)
+
+    def _on_manage_action(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items) or not self._manage_recording:
+            return
+        action = self._viewer_raw_items[raw_idx]
+        rec = self._manage_recording
+        if action == "delete":
+            try:
+                import os as _os
+                _os.remove(rec["path"])
+            except Exception:
+                pass
+            self._manage_recording = None
+            self._enter_recorder_manage()
+        elif action == "view-actions":
+            self._show_recording_actions(rec)
+
+    def _show_recording_actions(self, rec):
+        try:
+            from recording import Recording, action_label
+            r = Recording.load(rec["path"])
+            items = [f"  {i + 1:3}  {action_label(a)}" for i, a in enumerate(r.actions)]
+        except Exception as e:
+            items = [f"  error: {e}"]
+        self._viewer_raw_items = []
+        self._viewer_all       = items
+        self._viewer_shown_idx = list(range(len(items)))
+        self._viewer_on_enter  = None
+        self._var.set("")
+        self._prompt.config(text=f"{rec.get('name', '?')}  >")
+        self._lb.delete(0, "end")
+        for line in items:
+            self._lb.insert("end", line)
+        self._footer.config(text=f"{len(items)} actions  |  Esc=back")
+        if items:
+            self._lb.selection_set(0)
+            self._lb.activate(0)
 
     # ── Theme switcher ────────────────────────────────────────────────────────
 

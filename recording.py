@@ -135,3 +135,31 @@ class Recording:
                 pass
         results.sort(key=lambda r: r["recorded_at"], reverse=True)
         return results
+
+
+def action_label(action: "Action") -> str:
+    """Short human-readable label for an action (status bar, step overlay, viewers)."""
+    t = action.type
+    if t == "element_tap":
+        sel = action.selector
+        name = sel and (sel.resource_id or sel.content_desc or sel.text)
+        if name and "/" in name:
+            name = name.split("/")[-1]  # strip package prefix from resource_id
+        return f"element_tap: {name or '?'}"
+    elif t == "tap":
+        return f"tap ({action.x}, {action.y})"
+    elif t == "swipe":
+        return f"swipe ({action.x1},{action.y1})->({action.x2},{action.y2})"
+    elif t == "input_text":
+        preview = repr((action.text or "")[:20])
+        return f"input_text: {preview}"
+    elif t == "launch":
+        pkg = (action.package or "").split(".")[-1]
+        return f"launch: {pkg}"
+    elif t == "launch_deeplink":
+        return f"deeplink: {(action.url or '')[:30]}"
+    elif t == "keyevent":
+        return f"keyevent: {action.label or action.keycode}"
+    elif t == "wait":
+        return f"wait: {action.duration}ms"
+    return t

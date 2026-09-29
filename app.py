@@ -488,6 +488,11 @@ class KeyTap:
         elif t == 'app-action':
             self._dispatch_app_action(result['pkg'], result['action'])
 
+        elif t == 'insert-wait':
+            ms = result.get('ms', 1000)
+            self.recorder.record_wait(ms)
+            self._set_status(f"inserted wait: {ms}ms")
+
         elif t == 'start-recording':
             self.recorder.start()
             self._set_status("recording...  (double-shift -> Stop Recording to save)")
@@ -615,10 +620,65 @@ class KeyTap:
             )
             self.screen.blit(composited, (0, 0))
 
+        if self.replayer.active and self.replayer.mode == "step":
+            self._draw_step_overlay()
         self._draw_status()
         if self._stats_visible:
             self._draw_stats()
         pygame.display.flip()
+
+    def _draw_step_overlay(self):
+        from recording import action_label
+        rec = self.replayer.recording
+        if rec is None:
+            return
+        all_actions = rec.actions
+        total = len(all_actions)
+        if total == 0:
+            return
+        current = self.replayer.current_step
+        font = self._status_font
+        if not font:
+            return
+
+        VISIBLE = 9
+        half = VISIBLE // 2
+        start = max(0, min(current - half, total - VISIBLE))
+        end = min(total, start + VISIBLE)
+
+        line_h = font.get_height() + 3
+        pad = 8
+        header_h = font.get_height() + 8
+        panel_w = 340
+        panel_h = (end - start) * line_h + pad + header_h
+
+        x = self.win_w - panel_w - 4
+        y = 4
+
+        pygame.draw.rect(self.screen, (18, 18, 18), (x, y, panel_w, panel_h))
+        pygame.draw.rect(self.screen, (55, 55, 55), (x, y, panel_w, panel_h), 1)
+
+        header = f"STEP {current + 1}/{total}  Space=advance"
+        hs = font.render(header, True, (110, 110, 110))
+        self.screen.blit(hs, (x + pad, y + 4))
+
+        ty = y + header_h
+        max_chars = (panel_w - pad * 2) // 7  # ~7px per char at size 11
+
+        for i in range(start, end):
+            a = all_actions[i]
+            is_cur = (i == current)
+            prefix = "> " if is_cur else "  "
+            if is_cur:
+                color = (0, 200, 100)
+            elif i < current:
+                color = (65, 65, 65)
+            else:
+                color = (160, 160, 160)
+            label = f"{prefix}{i + 1:2}  {action_label(a)}"[:max_chars]
+            s = font.render(label, True, color)
+            self.screen.blit(s, (x + pad, ty))
+            ty += line_h
 
     def _draw_status(self):
         bar_y = self.win_h
