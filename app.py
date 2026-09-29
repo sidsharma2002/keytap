@@ -90,10 +90,15 @@ class KeyTap:
         self.net_recorder = NetworkRecorder()
         self.net_replayer = NetworkReplayer()
 
-        # Correlated per-frame timeline (logcat + screenshots + actions)
+        # Correlated per-frame timeline (logcat + actions)
         from timeline_recorder import TimelineRecorder
         self.timeline_recorder = TimelineRecorder()
         self._timeline_active  = False
+
+        # Video capture (records mirror stream to MP4 during recording)
+        from video_recorder import VideoRecorder
+        self.video_recorder = VideoRecorder()
+        self._video_active  = False
 
         # Status font
         self._status_font = self._try_font(11)
@@ -535,15 +540,19 @@ class KeyTap:
             self.elements.enter(ref_surf=self._raw_surf, headless=True)
             self.timeline_recorder.start(serial=ARGS.serial)
             self._timeline_active = True
+            self.video_recorder.start(self.capture.win_w, self.capture.win_h)
+            self._video_active = True
             self._set_status("recording...  (double-shift -> Stop Recording to save)")
 
         elif t == 'stop-recording':
             self._timeline_active = False
+            self._video_active    = False
             self.recorder.stop()
             network_capture = self.net_recorder.stop()
+            video_src       = self.video_recorder.stop()
             if self.elements._headless:
                 self.elements.exit()
-            timeline_events, screenshots = self.timeline_recorder.stop(
+            timeline_events = self.timeline_recorder.stop(
                 network_flows=network_capture.get("flows", [])
             )
             name = result.get('name', 'recording')
@@ -552,13 +561,15 @@ class KeyTap:
                     name, ARGS.serial, (self.dev_w, self.dev_h),
                     network_capture=network_capture,
                     timeline_events=timeline_events,
-                    screenshots=screenshots,
+                    video_src_path=video_src,
                 )
                 has_net      = bool(network_capture.get("flows"))
                 has_timeline = bool(timeline_events)
+                has_video    = bool(video_src)
                 parts = []
                 if has_net:      parts.append("network")
                 if has_timeline: parts.append("timeline")
+                if has_video:    parts.append("video")
                 suffix = (" + " + " + ".join(parts)) if parts else ""
                 self._set_status(f"saved: {os.path.basename(path)}{suffix}")
             except Exception as e:
@@ -824,6 +835,8 @@ class KeyTap:
             except queue.Empty:
                 pass
             if raw_frame is not None:
+                if self._video_active:
+                    self.video_recorder.push_frame(raw_frame)
                 # Direct bytes -> Surface: skips PIL tobytes() copy, ~2-10ms faster per frame
                 self._raw_surf = pygame.image.frombytes(
                     raw_frame, (self.capture.win_w, self.capture.win_h), 'RGB'

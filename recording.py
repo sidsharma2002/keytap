@@ -3,6 +3,7 @@ Data structures for recorded action sequences.
 """
 import json
 import os
+import shutil
 import time
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional
@@ -68,16 +69,17 @@ class Recording:
     network_host_tokens: dict = field(default_factory=dict)
     # correlated per-frame timeline (actions + logcat + network, sorted by t)
     timeline: List[dict] = field(default_factory=list)
+    video_path: Optional[str] = None   # relative path to screen.mp4 inside recording dir
 
-    def save(self, screenshots: Optional[dict] = None) -> str:
+    def save(self, screenshots: Optional[dict] = None,
+             video_src_path: Optional[str] = None) -> str:
         """
         Saves recording as a directory:
           ~/.keytap/recordings/{name}_{ts}/
             actions.json
             network.json        (only if network_flows non-empty)
             timeline.json       (only if timeline non-empty)
-            screenshots/        (only if screenshots non-empty)
-              step_001.png ...
+            screen.mp4          (only if video_src_path provided)
         Returns the directory path.
         """
         os.makedirs(RECORDINGS_DIR, exist_ok=True)
@@ -86,6 +88,12 @@ class Recording:
         dir_path = os.path.join(RECORDINGS_DIR, f"{safe}_{ts}")
         os.makedirs(dir_path, exist_ok=True)
 
+        # Move video from temp location into recording dir
+        if video_src_path and os.path.exists(video_src_path):
+            dest = os.path.join(dir_path, "screen.mp4")
+            shutil.move(video_src_path, dest)
+            self.video_path = "screen.mp4"
+
         actions_data = {
             "name": self.name,
             "recorded_at": self.recorded_at,
@@ -93,6 +101,8 @@ class Recording:
             "device_resolution": self.device_resolution,
             "actions": [a.to_dict() for a in self.actions],
         }
+        if self.video_path:
+            actions_data["video_path"] = self.video_path
         with open(os.path.join(dir_path, "actions.json"), "w") as f:
             json.dump(actions_data, f, indent=2)
 
@@ -104,22 +114,7 @@ class Recording:
             with open(os.path.join(dir_path, "network.json"), "w") as f:
                 json.dump(network_data, f, indent=2)
 
-        if self.timeline or screenshots:
-            screenshots = screenshots or {}
-            # Write PNG files, update screenshot paths in timeline events
-            if screenshots:
-                ss_dir = os.path.join(dir_path, "screenshots")
-                os.makedirs(ss_dir, exist_ok=True)
-                for action_index, png_bytes in screenshots.items():
-                    filename = f"step_{action_index + 1:03d}.png"
-                    with open(os.path.join(ss_dir, filename), "wb") as f:
-                        f.write(png_bytes)
-                    # patch screenshot path into the matching action event
-                    for evt in self.timeline:
-                        if (evt.get("type") == "action" and
-                                evt.get("action_index") == action_index):
-                            evt["screenshot"] = os.path.join("screenshots", filename)
-
+        if self.timeline:
             with open(os.path.join(dir_path, "timeline.json"), "w") as f:
                 json.dump({"events": self.timeline}, f, indent=2)
 

@@ -27,7 +27,7 @@ class ActionRecorder:
     def save(self, name: str, serial: str, device_resolution,
              network_capture: dict = None,
              timeline_events: list = None,
-             screenshots: dict = None) -> str:
+             video_src_path: str = None) -> str:
         network_capture = network_capture or {}
         recording = Recording(
             name=name,
@@ -39,7 +39,7 @@ class ActionRecorder:
             network_host_tokens=network_capture.get("host_tokens", {}),
             timeline=timeline_events or [],
         )
-        return recording.save(screenshots=screenshots)
+        return recording.save(video_src_path=video_src_path)
 
     @property
     def action_count(self) -> int:

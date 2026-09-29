@@ -4,13 +4,23 @@ timeline_viewer.py  —  per-frame recording viewer.
 Usage:
     python timeline_viewer.py [recording_dir]
 
-Keyboard: left/right arrows to step through actions.
+Keyboard: left/right arrows (or buttons) to step through actions.
+Displays the video frame at each action's timestamp alongside its events.
+Falls back to static screenshots for recordings without screen.mp4.
 """
+import base64
 import json
 import os
 import sys
 import tkinter as tk
 from tkinter import filedialog
+
+try:
+    import av
+    import numpy as np
+    _AV_OK = True
+except ImportError:
+    _AV_OK = False
 
 
 # ── data loading ──────────────────────────────────────────────────────────────
@@ -26,9 +36,15 @@ def load_recording(dir_path: str):
     actions_path = os.path.join(dir_path, "actions.json")
     if os.path.exists(actions_path):
         with open(actions_path) as f:
-            name = json.load(f).get("name", name)
+            d = json.load(f)
+        name = d.get("name", name)
 
-    return events, dir_path, name
+    video_path = None
+    mp4 = os.path.join(dir_path, "screen.mp4")
+    if os.path.exists(mp4):
+        video_path = mp4
+
+    return events, dir_path, name, video_path
 
 
 def build_steps(events):
@@ -46,9 +62,34 @@ def build_steps(events):
     return steps
 
 
+# ── video frame extraction ────────────────────────────────────────────────────
+
+def _frame_at_ms(container, t_ms: int):
+    """Seek to t_ms and return first decoded frame as (numpy array, w, h)."""
+    stream = container.streams.video[0]
+    try:
+        container.seek(t_ms, stream=stream, backward=True, any_frame=False)
+    except Exception:
+        container.seek(0)
+    for frame in container.decode(stream):
+        arr = frame.to_ndarray(format="rgb24")
+        return arr, frame.width, frame.height
+    return None, 0, 0
+
+
+def _arr_to_photoimage(arr, target_h: int = 560):
+    """Convert numpy RGB24 array to tk.PhotoImage via base64-encoded PPM."""
+    H, W = arr.shape[:2]
+    if H > target_h:
+        scale = max(1, H // target_h)
+        arr = arr[::scale, ::scale]
+        H, W = arr.shape[:2]
+    ppm = f"P6\n{W} {H}\n255\n".encode() + arr.tobytes()
+    return tk.PhotoImage(data=base64.b64encode(ppm))
+
+
 # ── event formatting ──────────────────────────────────────────────────────────
 
-# (color, bold)
 _COLORS = {
     "action":      ("#4fc3f7", True),
     "log_E":       ("#ef5350", False),
@@ -61,7 +102,6 @@ _COLORS = {
 
 
 def fmt(evt):
-    """Return (text, color_key)."""
     t   = evt.get("t", 0)
     typ = evt.get("type", "?")
     if typ == "action":
@@ -69,8 +109,8 @@ def fmt(evt):
                 "action")
     elif typ == "log":
         lvl = evt.get("level", "?")
-        s = f"  [{t:>6}ms]  {lvl}/{evt.get('tag','?')}: {evt.get('msg','')}"
-        return s, (f"log_{lvl}" if f"log_{lvl}" in _COLORS else "log_?")
+        return (f"  [{t:>6}ms]  {lvl}/{evt.get('tag','?')}: {evt.get('msg','')}",
+                f"log_{lvl}" if f"log_{lvl}" in _COLORS else "log_?")
     elif typ == "network_req":
         return (f"  [{t:>6}ms]  --> {evt.get('method','?')} {evt.get('url','?')}",
                 "network_req")
@@ -95,10 +135,11 @@ FONT = ("Menlo", 11)
 class TimelineViewer:
 
     def __init__(self, root: tk.Tk, dir_path: str):
-        self.root  = root
-        self.steps = []
-        self.idx   = 0
-        self._img  = None
+        self.root      = root
+        self.steps     = []
+        self.idx       = 0
+        self._img      = None
+        self._video    = None   # av.Container, kept open for seeking
 
         root.title("keytap  |  timeline viewer")
         root.configure(bg=BG)
@@ -108,11 +149,19 @@ class TimelineViewer:
         self._load(dir_path)
         root.bind("<Left>",  lambda _: self._nav(-1))
         root.bind("<Right>", lambda _: self._nav(+1))
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_close(self):
+        if self._video:
+            try:
+                self._video.close()
+            except Exception:
+                pass
+        self.root.destroy()
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        # top bar
         bar = tk.Frame(self.root, bg=SIDE, pady=6)
         bar.pack(fill=tk.X)
 
@@ -128,20 +177,17 @@ class TimelineViewer:
         self.lbl_step = tk.Label(bar, text="", bg=SIDE, fg=DIM, font=FONT)
         self.lbl_step.pack(side=tk.RIGHT, padx=12)
 
-        # main
         main = tk.Frame(self.root, bg=BG)
         main.pack(fill=tk.BOTH, expand=True)
 
-        # screenshot panel (fixed width)
         ss_frame = tk.Frame(main, bg=BG, width=300)
         ss_frame.pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=10)
         ss_frame.pack_propagate(False)
 
-        self.ss_lbl = tk.Label(ss_frame, bg=SIDE, text="no screenshot",
+        self.ss_lbl = tk.Label(ss_frame, bg=SIDE, text="no frame",
                                fg=DIM, font=FONT)
         self.ss_lbl.pack(fill=tk.BOTH, expand=True)
 
-        # events panel
         ev = tk.Frame(main, bg=BG)
         ev.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10), pady=10)
 
@@ -159,18 +205,33 @@ class TimelineViewer:
             self.txt.tag_configure(key, foreground=color,
                                    font=("Menlo", 11, "bold" if bold else "normal"))
 
-    # ── load / nav / render ──────────────────────────────────────────────────
+    # ── load ──────────────────────────────────────────────────────────────────
 
     def _load(self, dir_path: str):
         try:
-            events, self.dir_path, name = load_recording(dir_path)
+            events, self.dir_path, name, video_path = load_recording(dir_path)
         except Exception as e:
             self.lbl_title.configure(text=str(e))
             return
+
+        if video_path:
+            if _AV_OK:
+                try:
+                    self._video = av.open(video_path)
+                    # configure stream for faster seeking
+                    self._video.streams.video[0].codec_context.skip_frame = "NONREF"
+                except Exception as e:
+                    self.lbl_title.configure(text=f"video open failed: {e}")
+                    self._video = None
+            else:
+                self.ss_lbl.configure(text="install PyAV to enable video\n(pip install av)")
+
         self.steps = build_steps(events)
         self.lbl_title.configure(text=name)
         self.idx = 0
         self._render()
+
+    # ── nav / render ──────────────────────────────────────────────────────────
 
     def _nav(self, delta: int):
         if not self.steps:
@@ -186,12 +247,13 @@ class TimelineViewer:
 
         self.lbl_step.configure(text=f"Step {self.idx + 1} / {len(self.steps)}")
 
-        # screenshot
-        ss_path = act.get("screenshot")
-        if ss_path:
-            self._show_screenshot(os.path.join(self.dir_path, ss_path))
+        # frame
+        if self._video:
+            self._show_video_frame(act.get("t", 0))
+        elif act.get("screenshot"):
+            self._show_screenshot(os.path.join(self.dir_path, act["screenshot"]))
         else:
-            self.ss_lbl.configure(image="", text="no screenshot")
+            self.ss_lbl.configure(image="", text="no frame")
             self._img = None
 
         # events
@@ -212,6 +274,19 @@ class TimelineViewer:
 
         self.txt.configure(state=tk.DISABLED)
 
+    def _show_video_frame(self, t_ms: int):
+        try:
+            arr, w, h = _frame_at_ms(self._video, t_ms)
+            if arr is not None:
+                img = _arr_to_photoimage(arr)
+                self._img = img
+                self.ss_lbl.configure(image=img, text="")
+                return
+        except Exception as e:
+            pass
+        self.ss_lbl.configure(image="", text=f"seek failed @ {t_ms}ms")
+        self._img = None
+
     def _show_screenshot(self, path: str):
         if not os.path.exists(path):
             self.ss_lbl.configure(image="", text="screenshot missing")
@@ -220,14 +295,13 @@ class TimelineViewer:
         try:
             img = tk.PhotoImage(file=path)
             w, h = img.width(), img.height()
-            target_h = 580
-            if h > target_h:
-                factor = max(1, h // target_h)
+            if h > 560:
+                factor = max(1, h // 560)
                 img = img.subsample(factor, factor)
             self._img = img
             self.ss_lbl.configure(image=img, text="")
         except Exception as e:
-            self.ss_lbl.configure(image="", text=f"error loading: {e}")
+            self.ss_lbl.configure(image="", text=f"error: {e}")
             self._img = None
 
 
