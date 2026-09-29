@@ -95,7 +95,7 @@ def _arr_to_photoimage(arr, target_h: int = 560):
         arr = arr[::scale, ::scale]
         H, W = arr.shape[:2]
     ppm = f"P6\n{W} {H}\n255\n".encode() + arr.tobytes()
-    return tk.PhotoImage(data=base64.b64encode(ppm))
+    return tk.PhotoImage(data=base64.b64encode(ppm).decode("ascii"))
 
 
 # ── event formatting ──────────────────────────────────────────────────────────
@@ -285,7 +285,8 @@ class TimelineViewer:
                 self.ss_lbl.configure(image=img, text="")
                 return
         except Exception as e:
-            pass
+            self.ss_lbl.configure(image="", text=f"error: {e}")
+            self._img = None
         finally:
             if container:
                 try:
