@@ -35,7 +35,7 @@ info "Python $PY_VER found at $PYTHON"
 
 info "Installing Python dependencies..."
 
-PKGS=("av>=18.0" "numpy>=1.24" "Pillow>=9.0" "pygame>=2.0" "uiautomator2>=2.0")
+PKGS=("av>=18.0" "numpy>=1.24" "Pillow>=9.0" "pygame>=2.0" "uiautomator2>=2.0" "mitmproxy>=10.0")
 
 # Try plain install first; if PEP 668 blocks it (Homebrew/system Python),
 # retry with --user --break-system-packages which installs to ~/Library/Python.
@@ -62,8 +62,41 @@ check_tool() {
     fi
 }
 
-check_tool adb   "Install Android SDK platform-tools or run: brew install android-platform-tools"
+check_tool adb    "Install Android SDK platform-tools or run: brew install android-platform-tools"
 check_tool ffmpeg "Install ffmpeg (optional, used by screenrecord fallback): brew install ffmpeg"
+
+# ── mitmproxy CA cert (required for network capture) ──────────────────────────
+
+MITM_CERT="$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
+if [[ ! -f "$MITM_CERT" ]]; then
+    info "Generating mitmproxy CA certificate..."
+    timeout 2 mitmdump --quiet 2>/dev/null || true
+    if [[ -f "$MITM_CERT" ]]; then
+        info "CA cert generated at $MITM_CERT"
+    else
+        warn "Could not generate mitmproxy cert automatically. Run 'mitmdump' once manually."
+    fi
+else
+    info "mitmproxy CA cert already exists at $MITM_CERT"
+fi
+
+if [[ -f "$MITM_CERT" ]]; then
+    echo ""
+    warn "Network capture requires the mitmproxy CA cert installed on your Android device."
+    echo "  One-time device setup (debug apps only):"
+    echo ""
+    echo "  1. Push cert to device:"
+    echo "       adb push $MITM_CERT /sdcard/mitmproxy-ca.pem"
+    echo "  2. On device: Settings > Security > Install certificate > CA certificate"
+    echo "     Select mitmproxy-ca.pem from Internal Storage"
+    echo "  3. Your app's network_security_config.xml must allow user CAs:"
+    echo "       <debug-overrides>"
+    echo "           <trust-anchors>"
+    echo "               <certificates src=\"user\" />"
+    echo "           </trust-anchors>"
+    echo "       </debug-overrides>"
+    echo ""
+fi
 
 # ── Shell function ────────────────────────────────────────────────────────────
 

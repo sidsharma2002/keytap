@@ -24,13 +24,17 @@ class ActionRecorder:
     def stop(self):
         self.active = False
 
-    def save(self, name: str, serial: str, device_resolution) -> str:
+    def save(self, name: str, serial: str, device_resolution,
+             network_capture: dict = None) -> str:
+        network_capture = network_capture or {}
         recording = Recording(
             name=name,
             recorded_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
             serial=serial or "",
             device_resolution=list(device_resolution),
             actions=self._actions[:],
+            network_flows=network_capture.get("flows", []),
+            network_host_tokens=network_capture.get("host_tokens", {}),
         )
         return recording.save()
 
