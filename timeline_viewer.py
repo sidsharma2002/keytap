@@ -67,10 +67,14 @@ def build_steps(events):
 def _frame_at_ms(container, t_ms: int):
     """Seek to t_ms and return first decoded frame as (numpy array, w, h)."""
     stream = container.streams.video[0]
+    # Use AV_TIME_BASE (microseconds) — avoids stream time_base guessing
     try:
-        container.seek(t_ms, stream=stream, backward=True, any_frame=False)
+        container.seek(t_ms * 1000, backward=True)
     except Exception:
-        container.seek(0)
+        try:
+            container.seek(0)
+        except Exception:
+            pass
     for frame in container.decode(stream):
         arr = frame.to_ndarray(format="rgb24")
         return arr, frame.width, frame.height
@@ -218,8 +222,6 @@ class TimelineViewer:
             if _AV_OK:
                 try:
                     self._video = av.open(video_path)
-                    # configure stream for faster seeking
-                    self._video.streams.video[0].codec_context.skip_frame = "NONREF"
                 except Exception as e:
                     self.lbl_title.configure(text=f"video open failed: {e}")
                     self._video = None
