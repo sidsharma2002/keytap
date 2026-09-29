@@ -66,13 +66,18 @@ class Recording:
     actions: List[Action] = field(default_factory=list)
     network_flows: List[dict] = field(default_factory=list)
     network_host_tokens: dict = field(default_factory=dict)
+    # correlated per-frame timeline (actions + logcat + network, sorted by t)
+    timeline: List[dict] = field(default_factory=list)
 
-    def save(self) -> str:
+    def save(self, screenshots: Optional[dict] = None) -> str:
         """
         Saves recording as a directory:
           ~/.keytap/recordings/{name}_{ts}/
             actions.json
-            network.json   (only written if network_flows is non-empty)
+            network.json        (only if network_flows non-empty)
+            timeline.json       (only if timeline non-empty)
+            screenshots/        (only if screenshots non-empty)
+              step_001.png ...
         Returns the directory path.
         """
         os.makedirs(RECORDINGS_DIR, exist_ok=True)
@@ -98,6 +103,25 @@ class Recording:
             }
             with open(os.path.join(dir_path, "network.json"), "w") as f:
                 json.dump(network_data, f, indent=2)
+
+        if self.timeline or screenshots:
+            screenshots = screenshots or {}
+            # Write PNG files, update screenshot paths in timeline events
+            if screenshots:
+                ss_dir = os.path.join(dir_path, "screenshots")
+                os.makedirs(ss_dir, exist_ok=True)
+                for action_index, png_bytes in screenshots.items():
+                    filename = f"step_{action_index + 1:03d}.png"
+                    with open(os.path.join(ss_dir, filename), "wb") as f:
+                        f.write(png_bytes)
+                    # patch screenshot path into the matching action event
+                    for evt in self.timeline:
+                        if (evt.get("type") == "action" and
+                                evt.get("action_index") == action_index):
+                            evt["screenshot"] = os.path.join("screenshots", filename)
+
+            with open(os.path.join(dir_path, "timeline.json"), "w") as f:
+                json.dump({"events": self.timeline}, f, indent=2)
 
         return dir_path
 
