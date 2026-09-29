@@ -64,29 +64,96 @@ class Recording:
     serial: str
     device_resolution: List[int]
     actions: List[Action] = field(default_factory=list)
+    network_flows: List[dict] = field(default_factory=list)
+    network_host_tokens: dict = field(default_factory=dict)
 
     def save(self) -> str:
+        """
+        Saves recording as a directory:
+          ~/.keytap/recordings/{name}_{ts}/
+            actions.json
+            network.json   (only written if network_flows is non-empty)
+        Returns the directory path.
+        """
         os.makedirs(RECORDINGS_DIR, exist_ok=True)
         ts = time.strftime("%Y%m%d_%H%M%S")
         safe = "".join(c if c.isalnum() or c in "-_ " else "_" for c in self.name)
-        path = os.path.join(RECORDINGS_DIR, f"{safe}_{ts}.json")
-        data = {
+        dir_path = os.path.join(RECORDINGS_DIR, f"{safe}_{ts}")
+        os.makedirs(dir_path, exist_ok=True)
+
+        actions_data = {
             "name": self.name,
             "recorded_at": self.recorded_at,
             "serial": self.serial,
             "device_resolution": self.device_resolution,
             "actions": [a.to_dict() for a in self.actions],
         }
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
-        return path
+        with open(os.path.join(dir_path, "actions.json"), "w") as f:
+            json.dump(actions_data, f, indent=2)
+
+        if self.network_flows:
+            network_data = {
+                "host_tokens": self.network_host_tokens,
+                "flows": self.network_flows,
+            }
+            with open(os.path.join(dir_path, "network.json"), "w") as f:
+                json.dump(network_data, f, indent=2)
+
+        return dir_path
 
     @classmethod
     def load(cls, path: str) -> "Recording":
+        """
+        Loads a recording from:
+          - a directory (new format): reads actions.json + network.json
+          - a .json file (legacy format): reads single file
+        """
+        if os.path.isdir(path):
+            return cls._load_dir(path)
+        return cls._load_legacy(path)
+
+    @classmethod
+    def _load_dir(cls, dir_path: str) -> "Recording":
+        with open(os.path.join(dir_path, "actions.json")) as f:
+            data = json.load(f)
+
+        network_path = os.path.join(dir_path, "network.json")
+        network_flows: List[dict] = []
+        network_host_tokens: dict = {}
+        if os.path.exists(network_path):
+            with open(network_path) as f:
+                net = json.load(f)
+            network_flows = net.get("flows", [])
+            network_host_tokens = net.get("host_tokens", {})
+
+        return cls(
+            name=data["name"],
+            recorded_at=data["recorded_at"],
+            serial=data.get("serial", ""),
+            device_resolution=data.get("device_resolution", [0, 0]),
+            actions=cls._parse_actions(data.get("actions", [])),
+            network_flows=network_flows,
+            network_host_tokens=network_host_tokens,
+        )
+
+    @classmethod
+    def _load_legacy(cls, path: str) -> "Recording":
         with open(path) as f:
             data = json.load(f)
+        return cls(
+            name=data["name"],
+            recorded_at=data["recorded_at"],
+            serial=data.get("serial", ""),
+            device_resolution=data.get("device_resolution", [0, 0]),
+            actions=cls._parse_actions(data.get("actions", [])),
+            network_flows=data.get("network_flows", []),
+            network_host_tokens=data.get("network_host_tokens", {}),
+        )
+
+    @staticmethod
+    def _parse_actions(raw: list) -> "List[Action]":
         actions = []
-        for a in data.get("actions", []):
+        for a in raw:
             sel = ElementSelector(**a["selector"]) if a.get("selector") else None
             actions.append(Action(
                 t=a["t"],
@@ -104,33 +171,41 @@ class Recording:
                 keycode=a.get("keycode"),
                 label=a.get("label"),
             ))
-        return cls(
-            name=data["name"],
-            recorded_at=data["recorded_at"],
-            serial=data.get("serial", ""),
-            device_resolution=data.get("device_resolution", [0, 0]),
-            actions=actions,
-        )
+        return actions
 
     @classmethod
     def list_all(cls) -> List[dict]:
-        """Return [{path, name, recorded_at}] sorted newest first."""
+        """Return [{path, name, recorded_at, action_count, has_network}] sorted newest first."""
         if not os.path.isdir(RECORDINGS_DIR):
             return []
         results = []
-        for fname in os.listdir(RECORDINGS_DIR):
-            if not fname.endswith(".json"):
-                continue
-            path = os.path.join(RECORDINGS_DIR, fname)
+        for entry in os.listdir(RECORDINGS_DIR):
+            full = os.path.join(RECORDINGS_DIR, entry)
             try:
-                with open(path) as f:
-                    d = json.load(f)
-                results.append({
-                    "path": path,
-                    "name": d.get("name", fname),
-                    "recorded_at": d.get("recorded_at", ""),
-                    "action_count": len(d.get("actions", [])),
-                })
+                if os.path.isdir(full):
+                    actions_path = os.path.join(full, "actions.json")
+                    if not os.path.exists(actions_path):
+                        continue
+                    with open(actions_path) as f:
+                        d = json.load(f)
+                    results.append({
+                        "path": full,
+                        "name": d.get("name", entry),
+                        "recorded_at": d.get("recorded_at", ""),
+                        "action_count": len(d.get("actions", [])),
+                        "has_network": os.path.exists(os.path.join(full, "network.json")),
+                    })
+                elif entry.endswith(".json"):
+                    # legacy single-file recording
+                    with open(full) as f:
+                        d = json.load(f)
+                    results.append({
+                        "path": full,
+                        "name": d.get("name", entry),
+                        "recorded_at": d.get("recorded_at", ""),
+                        "action_count": len(d.get("actions", [])),
+                        "has_network": bool(d.get("network_flows")),
+                    })
             except Exception:
                 pass
         results.sort(key=lambda r: r["recorded_at"], reverse=True)

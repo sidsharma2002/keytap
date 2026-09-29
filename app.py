@@ -83,6 +83,12 @@ class KeyTap:
         self.recorder = ActionRecorder()
         self.replayer = ActionReplayer()
 
+        # Network capture (optional - requires mitmproxy + device cert setup)
+        from network_recorder import NetworkRecorder
+        from network_replayer import NetworkReplayer
+        self.net_recorder = NetworkRecorder()
+        self.net_replayer = NetworkReplayer()
+
         # Status font
         self._status_font = self._try_font(11)
 
@@ -495,14 +501,19 @@ class KeyTap:
 
         elif t == 'start-recording':
             self.recorder.start()
+            self.net_recorder.start()
             self._set_status("recording...  (double-shift -> Stop Recording to save)")
 
         elif t == 'stop-recording':
             self.recorder.stop()
+            network_capture = self.net_recorder.stop()
             name = result.get('name', 'recording')
             try:
-                path = self.recorder.save(name, ARGS.serial, (self.dev_w, self.dev_h))
-                self._set_status(f"saved: {os.path.basename(path)}")
+                path = self.recorder.save(name, ARGS.serial, (self.dev_w, self.dev_h),
+                                          network_capture=network_capture)
+                has_net = bool(network_capture.get("flows"))
+                suffix = " + network" if has_net else ""
+                self._set_status(f"saved: {os.path.basename(path)}{suffix}")
             except Exception as e:
                 self._set_status(f"save failed: {e}")
 
@@ -512,6 +523,11 @@ class KeyTap:
             try:
                 from recording import Recording
                 rec = Recording.load(path)
+                if rec.network_flows:
+                    self.net_replayer.start({
+                        "flows": rec.network_flows,
+                        "host_tokens": rec.network_host_tokens,
+                    })
                 self.replayer.start(
                     rec, mode, ARGS.serial,
                     on_status=self._set_status,
@@ -534,6 +550,7 @@ class KeyTap:
             actions.uninstall(pkg, on_status=self._set_status)
 
     def _on_replay_done(self, success, step, error):
+        self.net_replayer.stop()
         if success:
             self._set_status(f"replay complete  ({step} actions)")
         else:
@@ -793,6 +810,8 @@ class KeyTap:
             self.clock.tick(120)
 
         self.capture.stop()
+        self.net_recorder.stop()
+        self.net_replayer.shutdown()
         pygame.quit()
 
 
