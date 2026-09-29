@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import queue
 import string
@@ -834,6 +835,12 @@ class KeyTap:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
     if not ARGS.serial:
         devices = list_devices()
         if not devices:

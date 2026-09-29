@@ -3,12 +3,15 @@ ElementManager: element overlay state machine.
 Handles fetching, label input, change detection.
 """
 
+import logging
 import threading
 import time
 
 import pygame
 
-from elements import LABEL_CHARS, dump_elements
+from elements import LABEL_CHARS, _is_layout, dump_elements
+
+_LOG = logging.getLogger(__name__)
 
 
 class ElementManager:
@@ -99,14 +102,32 @@ class ElementManager:
     # ── Renderer data ────────────────────────────────────────────────────────
 
     def element_at(self, dx: int, dy: int):
-        """Return smallest element whose bounds contain device point (dx, dy), or None."""
+        """Return best element whose bounds contain device point (dx, dy), or None.
+
+        Ranking: leaf widget < layout container; then smallest area.
+        This ensures a Button inside a ConstraintLayout wins over the container.
+        """
         matches = [
             el for el in self._elements
             if el['x1'] <= dx <= el['x2'] and el['y1'] <= dy <= el['y2']
         ]
         if not matches:
+            _LOG.debug("element_at (%d,%d): no candidates", dx, dy)
             return None
-        return min(matches, key=lambda e: (e['x2'] - e['x1']) * (e['y2'] - e['y1']))
+
+        best = min(matches, key=lambda e: (
+            _is_layout(e.get('class_name', '')),          # 0=widget wins, 1=layout loses
+            (e['x2'] - e['x1']) * (e['y2'] - e['y1']),   # smaller area wins among ties
+        ))
+
+        _LOG.debug(
+            "element_at (%d,%d): %d candidates → picked class=%s id='%s' text='%s'",
+            dx, dy, len(matches),
+            best.get('class_name', '?'),
+            best.get('resource_id', ''),
+            best.get('text', ''),
+        )
+        return best
 
     def elements_for_renderer(self):
         """Return list of element dicts shaped for GridRenderer.composite()."""

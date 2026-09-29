@@ -155,30 +155,29 @@ class ActionReplayer:
     def _execute_element_tap(self, action: Action, serial: str):
         dev = self._u2_dev
         if dev is not None:
-            try:
-                el = self._find_element(dev, action.selector)
-                if el is not None:
-                    cx, cy = el.center()
-                    actions.tap(cx, cy)
-                    return True, None
-            except Exception as e:
-                if not action.reliable and action.fallback_coords:
-                    cx, cy = action.fallback_coords
-                    if self._on_status:
-                        self._on_status("[WARN] element lookup error, using fallback_coords")
-                    actions.tap(cx, cy)
-                    return True, None
-                return False, f"element lookup failed: {e}"
+            el, last_exc = self._wait_for_element(dev, action.selector)
 
-            # el is None — element not found in hierarchy
+            if el is not None:
+                cx, cy = el.center()
+                actions.tap(cx, cy)
+                return True, None
+
+            # Not found after wait — try fallback
             if not action.reliable and action.fallback_coords:
                 cx, cy = action.fallback_coords
                 sel = action.selector
                 name = sel.resource_id or sel.content_desc or sel.text or "?"
+                msg = "element lookup error" if last_exc else f"element '{name}' not found"
                 if self._on_status:
-                    self._on_status(f"[WARN] element '{name}' not found, using fallback_coords")
+                    self._on_status(f"[WARN] {msg} after 2s wait, using fallback_coords")
                 actions.tap(cx, cy)
                 return True, None
+
+            if last_exc:
+                return False, f"element lookup failed: {last_exc}"
+            sel = action.selector
+            desc = sel.resource_id or sel.content_desc or sel.text or "?"
+            return False, f"element '{desc}' not found after 2s wait"
         else:
             # u2 not connected — fall back to coords if possible
             if not action.reliable and action.fallback_coords:
@@ -191,6 +190,32 @@ class ActionReplayer:
         sel = action.selector
         desc = sel.resource_id or sel.content_desc or sel.text or "?"
         return False, f"element '{desc}' not found"
+
+    def _wait_for_element(self, dev, selector: ElementSelector, timeout_s: float = 2.0):
+        """Poll for element up to timeout_s. Returns (element_or_None, last_exc_or_None)."""
+        deadline = time.time() + timeout_s
+        last_exc = None
+        first = True
+        while True:
+            try:
+                el = self._find_element(dev, selector)
+                if el is not None:
+                    return el, None
+            except Exception as e:
+                last_exc = e
+
+            if time.time() >= deadline:
+                break
+
+            if first:
+                name = selector.resource_id or selector.content_desc or selector.text or "?"
+                if self._on_status:
+                    self._on_status(f"[WAIT] looking for '{name}'...")
+                first = False
+
+            time.sleep(0.2)
+
+        return None, last_exc
 
     def _find_element(self, dev, selector: ElementSelector):
         """Try selector fields in priority order. Returns u2 UiObject or None."""
