@@ -145,7 +145,14 @@ class KeyTap:
     # ── ADB actions ───────────────────────────────────────────────────────────
 
     def _tap(self, dx, dy):
-        self.recorder.record_tap(dx, dy)
+        if self.recorder.active:
+            el = self.elements.element_at(dx, dy)
+            if el is not None:
+                self.recorder.record_element_tap(el)
+            else:
+                self.recorder.record_tap(dx, dy)
+        else:
+            self.recorder.record_tap(dx, dy)
         actions.tap(dx, dy, on_status=self._set_status)
 
     def _keyevent(self, code, label=""):
@@ -202,10 +209,15 @@ class KeyTap:
 
         # Element mode toggle (priority)
         if cl == kb.element_mode:
-            if self.elements.active:
-                self.elements.exit()
+            if self.elements.active and not self.elements._headless:
+                # visible → back to headless if recording, else exit fully
+                if self.recorder.active:
+                    self.elements._headless = True
+                else:
+                    self.elements.exit()
             else:
-                self.elements.enter(ref_surf=self._raw_surf)
+                # inactive or headless → go visible (re-fetch for fresh labels)
+                self.elements.enter(ref_surf=self._raw_surf, headless=False)
             self._idle_status()
             return True
 
@@ -502,11 +514,14 @@ class KeyTap:
         elif t == 'start-recording':
             self.recorder.start()
             self.net_recorder.start()
+            self.elements.enter(ref_surf=self._raw_surf, headless=True)
             self._set_status("recording...  (double-shift -> Stop Recording to save)")
 
         elif t == 'stop-recording':
             self.recorder.stop()
             network_capture = self.net_recorder.stop()
+            if self.elements._headless:
+                self.elements.exit()
             name = result.get('name', 'recording')
             try:
                 path = self.recorder.save(name, ARGS.serial, (self.dev_w, self.dev_h),
@@ -784,7 +799,8 @@ class KeyTap:
                 self._idle_status()
                 if self.elements.active and not self.elements.loading:
                     if self.elements.check_screen_change(self._raw_surf):
-                        self.elements.enter(ref_surf=self._raw_surf)
+                        self.elements.enter(ref_surf=self._raw_surf,
+                                            headless=self.elements._headless)
                 # Consumer fps accounting
                 self._consumer_frames += 1
                 now = time.time()

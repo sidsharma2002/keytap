@@ -32,15 +32,18 @@ class ElementManager:
         self._buf        = []
         self._ref_surf   = None   # pygame Surface snapshot when last fetched
         self._last_dump_t = 0.0
+        self._headless   = False  # True when active for recording only (no visual)
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
-    def enter(self, ref_surf=None):
-        """Start element mode. ref_surf: current frame pygame Surface for change detection."""
+    def enter(self, ref_surf=None, headless=False):
+        """Start element mode. ref_surf: current frame pygame Surface for change detection.
+        headless=True: populate elements for recording lookups but show no labels."""
         if self.loading:
             return
         self.loading = True
-        if not self.active:
+        self._headless = headless
+        if not self.active and not headless:
             self._on_status("dumping UI hierarchy...")
         threading.Thread(target=self._fetch, args=(ref_surf,), daemon=True).start()
 
@@ -48,6 +51,7 @@ class ElementManager:
         self.active      = False
         self.loading     = False
         self.show_bounds = False
+        self._headless   = False
         self._elements   = []
         self._buf        = []
 
@@ -94,8 +98,20 @@ class ElementManager:
 
     # ── Renderer data ────────────────────────────────────────────────────────
 
+    def element_at(self, dx: int, dy: int):
+        """Return smallest element whose bounds contain device point (dx, dy), or None."""
+        matches = [
+            el for el in self._elements
+            if el['x1'] <= dx <= el['x2'] and el['y1'] <= dy <= el['y2']
+        ]
+        if not matches:
+            return None
+        return min(matches, key=lambda e: (e['x2'] - e['x1']) * (e['y2'] - e['y1']))
+
     def elements_for_renderer(self):
         """Return list of element dicts shaped for GridRenderer.composite()."""
+        if self._headless:
+            return []
         s   = self._scale
         buf = self._buf
         out = []
@@ -119,6 +135,8 @@ class ElementManager:
         return out
 
     def idle_status(self):
+        if self._headless:
+            return
         n = len(self._elements)
         bounds_hint = "Tab=hide bounds" if self.show_bounds else "Tab=show bounds"
         self._on_status(
@@ -160,7 +178,8 @@ class ElementManager:
             els = dump_elements(self._serial)
         except Exception as ex:
             self.loading = False
-            self._on_status(f"element dump failed: {ex}")
+            if not self._headless:
+                self._on_status(f"element dump failed: {ex}")
             return
 
         self._elements    = els
