@@ -279,11 +279,13 @@ class TimelineViewer:
         try:
             container = av.open(self._video_path)
             arr, w, h = _frame_at_ms(container, t_ms)
-            if arr is not None:
-                img = _arr_to_photoimage(arr)
-                self._img = img
-                self.ss_lbl.configure(image=img, text="")
+            if arr is None:
+                self.ss_lbl.configure(image="", text=f"no frame @ {t_ms}ms")
+                self._img = None
                 return
+            img = _arr_to_photoimage(arr)
+            self._img = img
+            self.ss_lbl.configure(image=img, text="")
         except Exception as e:
             self.ss_lbl.configure(image="", text=f"error: {e}")
             self._img = None
@@ -293,8 +295,6 @@ class TimelineViewer:
                     container.close()
                 except Exception:
                     pass
-        self.ss_lbl.configure(image="", text=f"seek failed @ {t_ms}ms")
-        self._img = None
 
     def _show_screenshot(self, path: str):
         if not os.path.exists(path):
