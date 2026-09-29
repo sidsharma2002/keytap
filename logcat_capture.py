@@ -19,13 +19,12 @@ _LOGCAT_RE = re.compile(
     r'^\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+\s+\d+\s+\d+\s+([A-Z])\s+(.+?)\s*:\s*(.*)'
 )
 
-# Sensible defaults — captures crashes, network, jank, without flooding
+# Sensible defaults — crashes, ANRs, jank only. No network tags (too noisy).
+# Add "OkHttp:D" / "Retrofit:D" via ~/.keytap/logcat_tags.txt for network logs.
 DEFAULT_TAGS = [
-    "OkHttp:D",
-    "Retrofit:D",
-    "AndroidRuntime:E",
-    "ActivityManager:W",
-    "Choreographer:W",
+    "AndroidRuntime:E",   # crashes / uncaught exceptions
+    "ActivityManager:W",  # activity lifecycle warnings, ANRs
+    "Choreographer:W",    # frame drops / jank (>16ms frames)
 ]
 
 

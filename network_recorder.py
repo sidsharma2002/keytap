@@ -92,11 +92,16 @@ def _free_port(port: int):
 # ── mitmproxy addon ───────────────────────────────────────────────────────────
 
 class _FlowCollectorAddon:
-    def __init__(self, scope_host: Optional[str]):
+    def __init__(self, scope_host: Optional[str], start_t: float):
         self.flows: List[dict] = []
         self._scope_host = scope_host
         self._seq = 0
         self._lock = threading.Lock()
+        self._start_t = start_t
+        self._req_times: dict = {}   # flow.id -> wall-clock time of request
+
+    def request(self, flow: "mhttp.HTTPFlow"):
+        self._req_times[flow.id] = time.time()
 
     def response(self, flow: "mhttp.HTTPFlow"):
         host = flow.request.pretty_host
@@ -135,6 +140,11 @@ class _FlowCollectorAddon:
             if k.lower() in KEEP_RESPONSE_HEADERS
         }
 
+        t_now = time.time()
+        t_req_abs = self._req_times.pop(flow.id, t_now)
+        t_req_ms  = int((t_req_abs - self._start_t) * 1000)
+        t_res_ms  = int((t_now    - self._start_t) * 1000)
+
         with self._lock:
             self._seq += 1
             self.flows.append({
@@ -147,6 +157,8 @@ class _FlowCollectorAddon:
                 "response_status": flow.response.status_code,
                 "response_headers": resp_headers,
                 "response_body": resp_body,
+                "t_request_ms":  t_req_ms,
+                "t_response_ms": t_res_ms,
             })
 
 
@@ -228,7 +240,8 @@ class NetworkRecorder:
             return False
 
         _free_port(PROXY_PORT)
-        self._addon = _FlowCollectorAddon(self._scope_host)
+        self._start_t = time.time()
+        self._addon = _FlowCollectorAddon(self._scope_host, self._start_t)
 
         def _run():
             import asyncio
