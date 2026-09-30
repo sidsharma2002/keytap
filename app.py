@@ -90,6 +90,16 @@ class KeyTap:
         self.net_recorder = NetworkRecorder()
         self.net_replayer = NetworkReplayer()
 
+        # Correlated per-frame timeline (logcat + actions)
+        from timeline_recorder import TimelineRecorder
+        self.timeline_recorder = TimelineRecorder()
+        self._timeline_active  = False
+
+        # Video capture (records mirror stream to MP4 during recording)
+        from video_recorder import VideoRecorder
+        self.video_recorder = VideoRecorder()
+        self._video_active  = False
+
         # Status font
         self._status_font = self._try_font(11)
 
@@ -145,6 +155,13 @@ class KeyTap:
 
     # ── ADB actions ───────────────────────────────────────────────────────────
 
+    def _after_action_recorded(self):
+        """Call immediately after any record_* call to feed the timeline."""
+        if self.recorder.active and self._timeline_active:
+            idx    = self.recorder.action_count - 1
+            action = self.recorder._actions[idx]
+            self.timeline_recorder.on_action(idx, action)
+
     def _tap(self, dx, dy):
         if self.recorder.active:
             el = self.elements.element_at(dx, dy)
@@ -154,10 +171,12 @@ class KeyTap:
                 self.recorder.record_tap(dx, dy)
         else:
             self.recorder.record_tap(dx, dy)
+        self._after_action_recorded()
         actions.tap(dx, dy, on_status=self._set_status)
 
     def _keyevent(self, code, label=""):
         self.recorder.record_keyevent(code, label)
+        self._after_action_recorded()
         actions.keyevent(code, label, on_status=self._set_status)
 
     def _scroll(self, direction):
@@ -168,6 +187,7 @@ class KeyTap:
             self.recorder.record_swipe(cx, max(cy - half, 0), cx, min(cy + half, self.dev_h - 1))
         else:
             self.recorder.record_swipe(cx, min(cy + half, self.dev_h - 1), cx, max(cy - half, 0))
+        self._after_action_recorded()
         actions.scroll(cx, cy, self.dev_h, direction, on_status=self._set_status)
 
     def _on_elem_tap(self, cx, cy, hint, element=None):
@@ -176,6 +196,7 @@ class KeyTap:
             self.recorder.record_element_tap(element)
         else:
             self.recorder.record_tap(cx, cy)
+        self._after_action_recorded()
         actions.tap(cx, cy)
 
     # ── Key handling ──────────────────────────────────────────────────────────
@@ -510,25 +531,46 @@ class KeyTap:
         elif t == 'insert-wait':
             ms = result.get('ms', 1000)
             self.recorder.record_wait(ms)
+            self._after_action_recorded()
             self._set_status(f"inserted wait: {ms}ms")
 
         elif t == 'start-recording':
             self.recorder.start()
             self.net_recorder.start()
             self.elements.enter(ref_surf=self._raw_surf, headless=True)
+            self.timeline_recorder.start(serial=ARGS.serial)
+            self._timeline_active = True
+            self.video_recorder.start(self.capture.win_w, self.capture.win_h)
+            self._video_active = True
             self._set_status("recording...  (double-shift -> Stop Recording to save)")
 
         elif t == 'stop-recording':
+            self._timeline_active = False
+            self._video_active    = False
             self.recorder.stop()
             network_capture = self.net_recorder.stop()
+            video_src       = self.video_recorder.stop()
             if self.elements._headless:
                 self.elements.exit()
+            timeline_events = self.timeline_recorder.stop(
+                network_flows=network_capture.get("flows", [])
+            )
             name = result.get('name', 'recording')
             try:
-                path = self.recorder.save(name, ARGS.serial, (self.dev_w, self.dev_h),
-                                          network_capture=network_capture)
-                has_net = bool(network_capture.get("flows"))
-                suffix = " + network" if has_net else ""
+                path = self.recorder.save(
+                    name, ARGS.serial, (self.dev_w, self.dev_h),
+                    network_capture=network_capture,
+                    timeline_events=timeline_events,
+                    video_src_path=video_src,
+                )
+                has_net      = bool(network_capture.get("flows"))
+                has_timeline = bool(timeline_events)
+                has_video    = bool(video_src)
+                parts = []
+                if has_net:      parts.append("network")
+                if has_timeline: parts.append("timeline")
+                if has_video:    parts.append("video")
+                suffix = (" + " + " + ".join(parts)) if parts else ""
                 self._set_status(f"saved: {os.path.basename(path)}{suffix}")
             except Exception as e:
                 self._set_status(f"save failed: {e}")
@@ -793,6 +835,8 @@ class KeyTap:
             except queue.Empty:
                 pass
             if raw_frame is not None:
+                if self._video_active:
+                    self.video_recorder.push_frame(raw_frame)
                 # Direct bytes -> Surface: skips PIL tobytes() copy, ~2-10ms faster per frame
                 self._raw_surf = pygame.image.frombytes(
                     raw_frame, (self.capture.win_w, self.capture.win_h), 'RGB'
