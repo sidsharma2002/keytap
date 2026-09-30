@@ -16,7 +16,7 @@ import tempfile
 import time
 import tkinter as tk
 from tkinter import filedialog, scrolledtext
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 try:
     import av
@@ -48,22 +48,26 @@ C_LOG_E    = "#c34043"
 C_LOG_W    = "#dca561"
 C_LOG_I    = "#52524e"   # dimmed — log info is noise
 C_LOG_D    = "#333330"
-C_PLAYHEAD = "#e0a060"   # amber — matches action accent
-C_RULER_BG = "#090909"
-C_RULER_FG = "#888880"    # axis tick labels — clearly readable
+C_PLAYHEAD       = "#e0a060"   # amber — matches action accent
+C_RULER_BG       = "#090909"
+C_RULER_FG       = "#888880"   # axis tick labels
+C_ACTION_BAR     = "#1e3358"   # muted navy — action step bars
+C_ACTION_BAR_SEL = "#3a5a9e"   # brighter when selected
+C_CRASH          = "#c34043"   # red crash marker
 
 # ── timeline geometry ─────────────────────────────────────────────────────────
 
-TL_MARGIN    = 10
+TL_LABEL_W   = 72    # left row-label column width
+TL_RIGHT     = 10    # right margin
 RULER_H      = 22
 ACTION_Y     = RULER_H + 8
-ACTION_H     = 16
-NET_BASE_Y   = ACTION_Y + ACTION_H + 10
-NET_LANE_H   = 16
-NET_LANE_GAP = 3
+ACTION_H     = 18
+NET_BASE_Y   = ACTION_Y + ACTION_H + 6
+NET_LANE_H   = 14
+NET_LANE_GAP = 2
 LOG_ABOVE    = 8
-LOG_DOT_R    = 4
-MIN_BAR_W    = 6
+LOG_DOT_R    = 3
+MIN_BAR_W    = 4
 
 _TMP_FRAME = os.path.join(tempfile.gettempdir(), "keytap_frame.ppm")
 
@@ -238,6 +242,12 @@ def fmt_ms(t_ms: int) -> str:
     return f"{t_ms / 1000:.1f}s"
 
 
+def fmt_ms_stamp(t_ms: int) -> str:
+    mins = t_ms // 60000
+    secs = (t_ms % 60000) / 1000
+    return f"{mins}:{secs:06.3f}"
+
+
 def fmt_url(url: str, max_len: int = 52) -> str:
     try:
         parsed = urlparse(url)
@@ -310,6 +320,13 @@ class _TimelineCanvas(tk.Canvas):
             [e for e in events if e.get("type") == "log"],
             key=lambda e: e.get("t", 0),
         )
+        self._crashes = [
+            e for e in self._logs
+            if e.get("level") == "E" and (
+                "FATAL" in (e.get("msg") or "") or
+                e.get("tag", "") in ("AndroidRuntime", "CRASH")
+            )
+        ]
 
         self.bind("<Configure>", lambda _: self._draw())
         self.bind("<Button-1>",  self._on_click)
@@ -321,11 +338,12 @@ class _TimelineCanvas(tk.Canvas):
 
     def _t2x(self, t_ms):
         w = self.winfo_width() or 800
-        return TL_MARGIN + (t_ms / self._total_ms) * (w - 2 * TL_MARGIN)
+        return TL_LABEL_W + (t_ms / self._total_ms) * (w - TL_LABEL_W - TL_RIGHT)
 
     def _x2t(self, x):
         w = self.winfo_width() or 800
-        ratio = (x - TL_MARGIN) / max(w - 2 * TL_MARGIN, 1)
+        usable = max(w - TL_LABEL_W - TL_RIGHT, 1)
+        ratio = (x - TL_LABEL_W) / usable
         return int(max(0, min(self._total_ms, ratio * self._total_ms)))
 
     def _on_click(self, e):
@@ -365,12 +383,13 @@ class _TimelineCanvas(tk.Canvas):
         self._draw_actions()
         self._draw_network()
         self._draw_logs()
+        self._draw_row_labels()
         self._draw_playhead()
 
     def _draw_ruler(self):
         w = self.winfo_width() or 800
         self.create_rectangle(0, 0, w, RULER_H, fill=C_RULER_BG, outline="")
-        usable    = w - 2 * TL_MARGIN
+        usable    = w - TL_LABEL_W - TL_RIGHT
         px_per_ms = usable / self._total_ms if self._total_ms else 1
         for iv in [200, 500, 1000, 2000, 5000, 10000, 30000]:
             if iv * px_per_ms >= 50:
@@ -386,6 +405,11 @@ class _TimelineCanvas(tk.Canvas):
             self.create_text(x, RULER_H // 2, text=label, fill=C_RULER_FG,
                              font=FONT_SM, anchor=tk.CENTER)
             t += tick_ms
+        for evt in self._crashes:
+            xc = self._t2x(evt.get("t", 0))
+            self.create_rectangle(xc - 1, 0, xc + 1, RULER_H, fill=C_CRASH, outline="")
+            self.create_text(xc + 3, RULER_H - 2, text="CRASH", fill=C_CRASH,
+                             font=("Menlo", 8, "bold"), anchor=tk.SW)
 
     def _draw_actions(self):
         prev_label_x = -100
@@ -446,6 +470,25 @@ class _TimelineCanvas(tk.Canvas):
                              x + LOG_DOT_R, log_y + LOG_DOT_R,
                              fill=color, outline="")
 
+    def _draw_row_labels(self):
+        lx = TL_LABEL_W - 6
+        h  = self.winfo_height() or 200
+        # vertical separator
+        self.create_line(TL_LABEL_W, RULER_H, TL_LABEL_W, h,
+                         fill=BORDER, width=1)
+        self.create_text(lx, ACTION_Y + ACTION_H // 2,
+                         text="ACTIONS", fill=DIM,
+                         font=("Menlo", 8), anchor=tk.E)
+        net_mid = NET_BASE_Y + (self._n_lanes * (NET_LANE_H + NET_LANE_GAP)) // 2
+        self.create_text(lx, net_mid,
+                         text="NETWORK", fill=DIM,
+                         font=("Menlo", 8), anchor=tk.E)
+        net_h = self._n_lanes * (NET_LANE_H + NET_LANE_GAP)
+        log_y = NET_BASE_Y + net_h + LOG_ABOVE + LOG_DOT_R
+        self.create_text(lx, log_y,
+                         text="LOGS", fill=DIM,
+                         font=("Menlo", 8), anchor=tk.E)
+
     def _draw_playhead(self):
         x = self._t2x(self._playhead)
         h = self.winfo_height() or 200
@@ -474,6 +517,12 @@ class TimelineViewer:
         self._selected_event = None  # flow dict or event dict (last explicit selection)
         self._row_to_event: dict = {}  # text line_no → event dict
         self._network_raw: dict = {}   # flow_id → raw flow from network.json
+        self._ev_filter      = "all"
+        self._filter_tabs: dict = {}
+        self.lbl_ev_window   = None
+        self._net_card       = None
+        self._net_card_key   = None   # tracks what's currently rendered in the card
+        self._txt_window_key = None   # (t_start, t_end, filter) — skip rebuild when same
 
         root.title("keytap  |  timeline")
         root.configure(bg=BG)
@@ -481,7 +530,7 @@ class TimelineViewer:
         root.bind("<Left>",   lambda _: self._prev_action())
         root.bind("<Right>",  lambda _: self._next_action())
         root.bind("<space>",  lambda _: self._toggle_play())
-        root.bind("<Return>", lambda _: self._on_expand())
+        root.bind("<Return>", lambda _: self._seek_to_selected())
 
         self._build_ui()
         self._load(dir_path)
@@ -536,21 +585,40 @@ class TimelineViewer:
 
         tk.Frame(main, bg=BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y)
 
-        ev_outer = tk.Frame(main, bg=BG, width=420)
+        ev_outer = tk.Frame(main, bg=BG, width=440)
         ev_outer.pack(side=tk.RIGHT, fill=tk.Y)
         ev_outer.pack_propagate(False)
 
         ev_header = tk.Frame(ev_outer, bg=SIDE, pady=6)
         ev_header.pack(fill=tk.X)
-        tk.Label(ev_header, text="Events", bg=SIDE, fg=DIM,
-                 font=FONT, padx=12).pack(side=tk.LEFT)
+        tk.Label(ev_header, text="Events", bg=SIDE, fg=FG,
+                 font=("Menlo", 11, "bold"), padx=12).pack(side=tk.LEFT)
+        self.lbl_ev_window = tk.Label(ev_header, text="", bg=SIDE, fg=DIM,
+                                      font=FONT_SM)
+        self.lbl_ev_window.pack(side=tk.RIGHT, padx=12)
         tk.Frame(ev_outer, bg=BORDER, height=1).pack(fill=tk.X)
 
+        # filter tabs
+        tab_row = tk.Frame(ev_outer, bg=SIDE, pady=5, padx=4)
+        tab_row.pack(fill=tk.X)
+        for key, label in [("all", "All"), ("actions", "Actions"),
+                            ("network", "Network"), ("logs", "Logs")]:
+            lbl = tk.Label(tab_row, text=label, bg=SIDE, fg=DIM,
+                           font=FONT_SM, padx=8, pady=2, cursor="hand2")
+            lbl.pack(side=tk.LEFT, padx=2)
+            lbl.bind("<Button-1>", lambda e, k=key: self._set_filter(k))
+            self._filter_tabs[key] = lbl
+        tk.Frame(ev_outer, bg=BORDER, height=1).pack(fill=tk.X)
+
+        # inline network card — always packed, empty = zero height
+        self._net_card = tk.Frame(ev_outer, bg=BTN, padx=12, pady=0)
+        self._net_card.pack(fill=tk.X)
+
         self.txt = tk.Text(
-            ev_outer, bg=SIDE, fg=FG, font=FONT,
+            ev_outer, bg=SIDE, fg=FG, font=FONT_SM,
             relief=tk.FLAT, wrap=tk.CHAR,
             state=tk.DISABLED, cursor="arrow",
-            padx=12, pady=10, spacing1=1, spacing3=3,
+            padx=12, pady=10, spacing1=1, spacing3=2,
         )
         sb = tk.Scrollbar(ev_outer, command=self.txt.yview,
                           bg=BTN, troughcolor=SIDE)
@@ -568,17 +636,14 @@ class TimelineViewer:
             ("log_I",   C_LOG_I,   False),
             ("log_D",   C_LOG_D,   False),
             ("dim",     DIM,       False),
-            ("section", DIM,       False),
+            ("ts",      DIM,       False),
         ]:
-            fnt = ("Menlo", 12, "bold") if bold else FONT
+            fnt = ("Menlo", 10, "bold") if bold else FONT_SM
             self.txt.tag_configure(tag, foreground=fg_color, font=fnt)
-        self.txt.tag_configure("section", font=("Menlo", 10))
-        # Highlight: bright amber bg + dark text. tag_raise ensures it wins
-        # over any per-event color tag regardless of configuration order.
         self.txt.tag_configure("cur_bg",
                                background=SEL_BG,
                                foreground=SEL_FG,
-                               font=("Menlo", 12, "bold"))
+                               font=("Menlo", 10, "bold"))
         self.txt.tag_raise("cur_bg")
         self.txt.bind("<Button-1>",        self._on_txt_click)
         self.txt.bind("<Double-Button-1>", self._on_txt_double_click)
@@ -588,8 +653,31 @@ class TimelineViewer:
         paned.add(self._tl_frame, minsize=70, height=140, stretch="never")
 
     def _build_timeline(self):
-        if self._tl_canvas:
-            self._tl_canvas.destroy()
+        for w in self._tl_frame.winfo_children():
+            w.destroy()
+        self._tl_canvas = None
+
+        # legend strip
+        leg = tk.Frame(self._tl_frame, bg=SIDE, pady=3)
+        leg.pack(fill=tk.X, side=tk.TOP)
+        acts = [e for e in self._events if e.get("type") == "action"]
+        dur_s = f"{self._total_ms / 1000:.0f}s"
+        tk.Label(leg, text=f"Timeline  0s - {dur_s}  ·  full recording",
+                 bg=SIDE, fg=DIM, font=("Menlo", 9), padx=12).pack(side=tk.LEFT)
+        for dot_col, lbl in reversed([
+            (C_NET_OK,   "2\u00d7\u00d7"),
+            (C_NET_ERR,  "error"),
+            (C_NET_OPEN, "pending"),
+            (C_LOG_W,    "warn"),
+            (C_LOG_E,    "error"),
+        ]):
+            tk.Label(leg, text=lbl, bg=SIDE, fg=DIM,
+                     font=("Menlo", 9)).pack(side=tk.RIGHT, padx=(0, 6))
+            tk.Label(leg, text="\u25cf", bg=SIDE, fg=dot_col,
+                     font=("Menlo", 9)).pack(side=tk.RIGHT, padx=(6, 0))
+
+        tk.Frame(self._tl_frame, bg=BORDER, height=1).pack(fill=tk.X)
+
         self._tl_canvas = _TimelineCanvas(
             self._tl_frame, self._events, self._net_flows, self._total_ms,
             on_seek=self._seek,
@@ -610,7 +698,9 @@ class TimelineViewer:
         self._video_path = video_path if (_AV_OK and video_path) else None
         self._net_flows  = build_net_flows(events)
         self._total_ms   = total_duration_ms(events, video_path)
-        self._selected_event = None
+        self._selected_event  = None
+        self._txt_window_key  = None
+        self._net_card_key    = None
         self._network_raw = {}
         net_path = os.path.join(dir_path, "network.json")
         if os.path.exists(net_path):
@@ -619,7 +709,9 @@ class TimelineViewer:
                     data = json.load(f)
                 flows = data if isinstance(data, list) else data.get("flows", [])
                 self._network_raw = {
-                    str(fl.get("id")): fl for fl in flows if fl.get("id")
+                    str(fl.get("id") or fl.get("seq")): fl
+                    for fl in flows
+                    if fl.get("id") or fl.get("seq")
                 }
             except Exception:
                 pass
@@ -726,10 +818,92 @@ class TimelineViewer:
 
     # ── events panel ─────────────────────────────────────────────────────────
 
+    def _set_filter(self, key: str):
+        self._ev_filter = key
+        self._update_events()
+
+    def _show_net_card(self, flow):
+        for w in self._net_card.winfo_children():
+            w.destroy()
+        req    = flow.get("req_evt") or {}
+        res    = flow.get("res_evt") or {}
+        method = req.get("method") or flow.get("method", "?")
+        url    = req.get("url")    or flow.get("url", "?")
+        status = res.get("status") or flow.get("status")
+        t_req  = flow.get("t_req", req.get("t", 0))
+        t_res  = flow.get("t_res")
+
+        top = tk.Frame(self._net_card, bg=BTN)
+        top.pack(fill=tk.X, pady=(6, 2))
+        m_col = C_NET_ERR if _is_err_status(status) else C_NET_REQ
+        tk.Label(top, text=method, bg=BTN, fg=m_col,
+                 font=("Menlo", 10, "bold")).pack(side=tk.LEFT)
+        tk.Label(top, text=f"  {fmt_url(url, max_len=34)}", bg=BTN, fg=FG,
+                 font=("Menlo", 10)).pack(side=tk.LEFT)
+        tk.Button(top, text="\u00d7", bg=BTN, fg=DIM, relief=tk.FLAT,
+                  font=("Menlo", 11), cursor="hand2",
+                  command=self._hide_net_card).pack(side=tk.RIGHT)
+
+        dur_text = "-"
+        if t_res is not None:
+            d = t_res - t_req
+            dur_text = f"{d / 1000:.2f} s" if d >= 1000 else f"{d} ms"
+        elif t_req is not None:
+            dur_text = f"> {(self._total_ms - t_req) / 1000:.2f} s"
+
+        meta = tk.Frame(self._net_card, bg=BTN, pady=2)
+        meta.pack(fill=tk.X)
+        for col, (hdr, val) in enumerate([
+            ("STATUS",   str(status) if status else "none"),
+            ("START",    fmt_ms_stamp(t_req) if t_req is not None else "-"),
+            ("DURATION", dur_text),
+            ("SIZE",     "-"),
+        ]):
+            cf = tk.Frame(meta, bg=BTN, padx=8)
+            cf.grid(row=0, column=col, sticky="w")
+            tk.Label(cf, text=hdr, bg=BTN, fg=DIM,
+                     font=("Menlo", 8)).pack(anchor="w")
+            vfg = C_NET_ERR if hdr == "STATUS" and _is_err_status(status) else FG
+            tk.Label(cf, text=val, bg=BTN, fg=vfg,
+                     font=("Menlo", 9, "bold")).pack(anchor="w")
+
+        if t_res is None and t_req is not None:
+            note = tk.Frame(self._net_card, bg="#181820", padx=8, pady=4)
+            note.pack(fill=tk.X, pady=(4, 0))
+            tk.Label(note, text="NO RESP", bg="#181820", fg=C_NET_OPEN,
+                     font=("Menlo", 8, "bold")).pack(side=tk.LEFT)
+            tk.Label(note, text="  Request sent \u2014 no response captured.",
+                     bg="#181820", fg=DIM, font=("Menlo", 9),
+                     wraplength=280, justify=tk.LEFT).pack(side=tk.LEFT)
+
+        btn_row = tk.Frame(self._net_card, bg=BTN, pady=5)
+        btn_row.pack(fill=tk.X)
+        tk.Button(btn_row, text="Seek to start",
+                  bg=BORDER, fg=FG, relief=tk.FLAT, padx=6, pady=2,
+                  font=("Menlo", 9), cursor="hand2",
+                  command=lambda: self._seek(t_req or 0)).pack(side=tk.LEFT, padx=(0, 4))
+        fid = req.get("flow_id")
+        raw = self._network_raw.get(str(fid)) if fid else None
+        if raw:
+            tk.Button(btn_row, text="Request / response \u2197",
+                      bg=BORDER, fg=FG, relief=tk.FLAT, padx=6, pady=2,
+                      font=("Menlo", 9), cursor="hand2",
+                      command=lambda: self._open_flow_popup(flow, raw)).pack(side=tk.LEFT)
+
+        tk.Frame(self._net_card, bg=BORDER, height=1).pack(fill=tk.X, pady=(6, 0))
+
+    def _hide_net_card(self):
+        self._net_card_key = None
+        self._selected_event = None
+        for w in self._net_card.winfo_children():
+            w.destroy()
+
     def _update_events(self):
         selected = self._selected_event
         acts = sorted([e for e in self._events if e.get("type") == "action"],
                       key=lambda e: e.get("t", 0))
+        act_step = {id(a): i + 1 for i, a in enumerate(acts)}
+
         t_start, t_end = 0, self._total_ms
         for i, a in enumerate(acts):
             if a.get("t", 0) <= self._playhead:
@@ -742,93 +916,161 @@ class TimelineViewer:
             key=lambda e: e.get("t", 0),
         )
 
-        self._row_to_event = {}
-        self.txt.configure(state=tk.NORMAL)
-        self.txt.delete("1.0", tk.END)
+        counts = {
+            "all":     len(window),
+            "actions": sum(1 for e in window if e.get("type") == "action"),
+            "network": sum(1 for e in window
+                          if e.get("type") in ("network_req", "network_res")),
+            "logs":    sum(1 for e in window if e.get("type") == "log"),
+        }
 
-        RULE = "\u2500" * 44 + "\n"
+        if self.lbl_ev_window:
+            self.lbl_ev_window.configure(
+                text=f"window {t_start / 1000:.1f}s \u2013 {t_end / 1000:.1f}s"
+            )
 
-        # ── selected item header (from timeline / panel click) ────────────────
-        if selected is not None:
-            if "req_evt" in selected:
-                req = selected.get("req_evt")
-                res = selected.get("res_evt")
-                self.txt.insert(tk.END, "  SELECTED CALL  (Enter to expand)\n", "section")
-                self.txt.insert(tk.END, "\n")
-                if req:
-                    method = req.get("method", "?")
-                    path   = fmt_url(req.get("url", "?"), max_len=62)
-                    self.txt.insert(tk.END, f"  {method}  {path}\n", "net_req")
-                if res:
-                    st    = res.get("status", "?")
-                    dur   = (res.get("t", 0) - req.get("t", 0)) if req else None
-                    tag   = "net_err" if _is_err_status(st) else "net_res"
-                    dur_s = f"  ({dur}ms)" if dur is not None else ""
-                    self.txt.insert(tk.END, f"  {st}{dur_s}\n", tag)
-                    self.txt.insert(tk.END, f"\n  {selected.get('url','')}\n", "dim")
-                else:
-                    self.txt.insert(tk.END, "  no response captured\n", "dim")
-                self.txt.insert(tk.END, "\n" + RULE + "\n", "section")
-            elif selected.get("type") in ("network_req", "network_res"):
-                line_s, tag_s = fmt_event(selected)
-                self.txt.insert(tk.END, "  SELECTED  (Enter to expand)\n\n", "section")
-                self.txt.insert(tk.END, f"  {line_s}\n\n", tag_s)
-                self.txt.insert(tk.END, RULE + "\n", "section")
-            else:
-                line_s, tag_s = fmt_event(selected)
-                self.txt.insert(tk.END, "  SELECTED\n\n", "section")
-                self.txt.insert(tk.END, f"  {line_s}\n\n", tag_s)
-                self.txt.insert(tk.END, RULE + "\n", "section")
+        label_map = {"all": "All", "actions": "Actions",
+                     "network": "Network", "logs": "Logs"}
+        for key, lbl in self._filter_tabs.items():
+            lbl.configure(
+                text=f"\u25cf {label_map[key]}  {counts[key]}",
+                fg=FG if key == self._ev_filter else DIM,
+                bg=BORDER if key == self._ev_filter else SIDE,
+            )
 
-        # ── step window ───────────────────────────────────────────────────────
-        self.txt.insert(tk.END,
-                        f"  {fmt_ms(t_start)}  \u2192  {fmt_ms(t_end)}\n\n",
-                        "section")
+        # net card — only rebuild when selection identity changes
+        if selected is not None and "req_evt" in selected:
+            new_key = id(selected)
+            if new_key != self._net_card_key:
+                self._net_card_key = new_key
+                self._show_net_card(selected)
+        elif (selected is not None and
+              selected.get("type") in ("network_req", "network_res")):
+            new_key = id(selected)
+            if new_key != self._net_card_key:
+                self._net_card_key = new_key
+                pseudo = {
+                    "req_evt": selected if selected.get("type") == "network_req" else None,
+                    "res_evt": selected if selected.get("type") == "network_res" else None,
+                    "method":  selected.get("method"),
+                    "url":     selected.get("url"),
+                    "t_req":   selected.get("t", 0),
+                    "t_res":   None,
+                    "status":  selected.get("status"),
+                }
+                self._show_net_card(pseudo)
+        else:
+            if self._net_card_key is not None:
+                self._net_card_key = None
+                self._hide_net_card()
 
-        prev_type  = None
-        scroll_line = None  # line to scroll to (selected event in list)
+        def matches(e):
+            if self._ev_filter == "all":     return True
+            t = e.get("type", "")
+            if self._ev_filter == "actions": return t == "action"
+            if self._ev_filter == "network": return t in ("network_req", "network_res")
+            if self._ev_filter == "logs":    return t == "log"
+            return True
 
-        # identities of the selected event(s) for highlight
+        filtered = [e for e in window if matches(e)]
+
         sel_ids = set()
         if selected is not None:
             if "req_evt" in selected:
-                if selected.get("req_evt") is not None:
-                    sel_ids.add(id(selected["req_evt"]))
-                if selected.get("res_evt") is not None:
-                    sel_ids.add(id(selected["res_evt"]))
+                if selected.get("req_evt"): sel_ids.add(id(selected["req_evt"]))
+                if selected.get("res_evt"): sel_ids.add(id(selected["res_evt"]))
             else:
                 sel_ids.add(id(selected))
 
-        for evt in window:
-            typ = evt.get("type", "?")
-            if prev_type and typ != prev_type:
-                self.txt.insert(tk.END, "\n")
-            prev_type = typ
+        # ── skip full rebuild when only selection/highlight changed ───────────
+        window_key = (t_start, t_end, self._ev_filter)
+        if window_key == self._txt_window_key:
+            # tag-only update — no delete/reinsert, no flicker
+            self.txt.configure(state=tk.NORMAL)
+            self.txt.tag_remove("cur_bg", "1.0", tk.END)
+            scroll_line = None
+            for line_no, evt in self._row_to_event.items():
+                is_sel = id(evt) in sel_ids
+                near   = abs(evt.get("t", 0) - self._playhead) <= 400
+                hl     = is_sel if selected is not None else near
+                if hl:
+                    self.txt.tag_add("cur_bg", f"{line_no}.0", f"{line_no + 1}.0")
+                    if scroll_line is None or is_sel:
+                        scroll_line = line_no
+            self.txt.configure(state=tk.DISABLED)
+            if scroll_line is not None:
+                self.txt.see(f"{scroll_line}.0")
+            return
 
-            row_line = int(self.txt.index(tk.END).split(".")[0])
+        # ── full rebuild (window or filter changed) ───────────────────────────
+        self._txt_window_key = window_key
+        self._row_to_event = {}
+        self.txt.configure(state=tk.NORMAL)
+        self.txt.delete("1.0", tk.END)
+        scroll_line = None
+        row_line = 1
+
+        for evt in filtered:
+            t      = evt.get("t", 0)
+            typ    = evt.get("type", "?")
+            is_sel = id(evt) in sel_ids
+            near   = abs(t - self._playhead) <= 400
+            hl     = is_sel if selected is not None else near
+
             self._row_to_event[row_line] = evt
-
-            line, tag = fmt_event(evt)
-            near      = abs(evt.get("t", 0) - self._playhead) <= 400
-            is_sel    = id(evt) in sel_ids
-
             if is_sel:
                 scroll_line = row_line
-                tags = (tag, "cur_bg")
-            elif near:
-                tags = (tag, "cur_bg")
-            else:
-                tags = (tag,)
+            elif near and scroll_line is None:
+                scroll_line = row_line
 
-            self.txt.insert(tk.END, f"  {line}\n", tags)
+            def ins(text, *tags, _hl=hl):
+                all_tags = tags + (("cur_bg",) if _hl else ())
+                self.txt.insert(tk.END, text, all_tags)
+
+            ins(f"  {fmt_ms_stamp(t)}  ", "ts")
+
+            if typ == "action":
+                at   = (evt.get("action_type") or "?").upper()[:5]
+                hint = evt.get("hint", "")
+                step = act_step.get(id(evt))
+                ins(at, "action")
+                ins(f"  {hint[:40]}", "dim")
+                if step:
+                    ins(f"   step {step}", "dim")
+
+            elif typ in ("network_req", "network_res"):
+                method = evt.get("method", "?")
+                path   = fmt_url(evt.get("url", "?"), max_len=26)
+                if typ == "network_req":
+                    ins("\u2192 ", "dim")
+                    ins(method, "net_req")
+                    ins(f"  {path}", "dim")
+                else:
+                    st   = evt.get("status")
+                    btag = "net_err" if _is_err_status(st) else "net_res"
+                    dur  = evt.get("duration_ms")
+                    ins("\u2190 ", "dim")
+                    ins(method, btag)
+                    ins(f"  {path}", "dim")
+                    if st:
+                        dur_s = f"  {dur}ms" if dur else ""
+                        ins(f"  {st}{dur_s}", btag)
+
+            elif typ == "log":
+                lvl  = evt.get("level", "?")
+                ltag = {"E": "log_E", "W": "log_W", "I": "log_I"}.get(lvl, "dim")
+                tag_name = evt.get("tag", "")
+                msg  = (evt.get("msg") or "")[:50]
+                desc = f"{tag_name}: {msg}" if tag_name else msg
+                ins(lvl, ltag)
+                ins(f"  {desc}", "dim")
+
+            self.txt.insert(tk.END, "\n")
+            row_line += 1
 
         self.txt.configure(state=tk.DISABLED)
-
-        # scroll to selected event row; fall back to top (shows SELECTED block)
         if scroll_line is not None:
             self.txt.see(f"{scroll_line}.0")
-        elif selected is not None:
-            self.txt.see("1.0")
 
 
     # ── right panel interaction ───────────────────────────────────────────────
@@ -846,7 +1088,7 @@ class TimelineViewer:
         evt = self._row_to_event.get(line)
         if evt is not None:
             self._selected_event = evt
-            self._seek(evt.get("t", 0))
+            self._update_events()  # highlight only, no seek
 
     def _on_txt_double_click(self, _event):
         self.txt.after_idle(self._handle_txt_double)
@@ -863,22 +1105,41 @@ class TimelineViewer:
             self._selected_event = evt
             self._on_expand()
 
+    def _seek_to_selected(self):
+        sel = self._selected_event
+        if sel is None:
+            return
+        if "req_evt" in sel:
+            t = sel.get("t_req", (sel.get("req_evt") or {}).get("t", 0))
+        else:
+            t = sel.get("t", 0)
+        self._seek(t)
+
     def _on_expand(self):
         """Open network detail popup for the currently selected event."""
         sel = self._selected_event
         if sel is None:
             return
-        # flow dict (from timeline bar click)
         if "req_evt" in sel:
             req = sel.get("req_evt") or {}
             res = sel.get("res_evt") or {}
             fid = req.get("flow_id") or res.get("flow_id")
-        # raw event dict
+            url = req.get("url") or res.get("url", "")
         elif sel.get("type") in ("network_req", "network_res"):
             fid = sel.get("flow_id")
+            url = sel.get("url", "")
         else:
             return
+        # primary: match by flow_id
         raw = self._network_raw.get(str(fid)) if fid else None
+        # fallback: match by URL
+        if raw is None and url and self._network_raw:
+            for fl in self._network_raw.values():
+                fl_url = (fl.get("url") or
+                          (fl.get("request") or {}).get("url") or "")
+                if fl_url == url:
+                    raw = fl
+                    break
         self._open_flow_popup(sel, raw)
 
     def _open_flow_popup(self, sel, raw_flow):
@@ -932,40 +1193,79 @@ class TimelineViewer:
         txt.insert(tk.END, f"{fmt_ms(t_req)}\n\n", "dim")
         txt.insert(tk.END, RULE, "dim")
 
+        def _insert_headers(h):
+            if isinstance(h, list):
+                for item in h:
+                    if isinstance(item, (list, tuple)) and len(item) == 2:
+                        txt.insert(tk.END, f"  {item[0]}: ", "key")
+                        txt.insert(tk.END, f"{item[1]}\n", "val")
+            elif isinstance(h, dict):
+                for k, v in h.items():
+                    txt.insert(tk.END, f"  {k}: ", "key")
+                    txt.insert(tk.END, f"{v}\n", "val")
+
         if raw_flow:
-            def _insert_headers(h):
-                if isinstance(h, list):
-                    for item in h:
-                        if isinstance(item, (list, tuple)) and len(item) == 2:
-                            txt.insert(tk.END, f"  {item[0]}: ", "key")
-                            txt.insert(tk.END, f"{item[1]}\n", "val")
-                elif isinstance(h, dict):
-                    for k, v in h.items():
-                        txt.insert(tk.END, f"  {k}: ", "key")
-                        txt.insert(tk.END, f"{v}\n", "val")
-
-            req_obj  = raw_flow.get("request") or {}
-            res_obj  = raw_flow.get("response") or {}
-
-            txt.insert(tk.END, "REQUEST\n", "hdr")
+            req_obj = raw_flow.get("request") or {}
+            res_obj = raw_flow.get("response") or {}
             req_hdrs = raw_flow.get("request_headers") or req_obj.get("headers")
-            if req_hdrs:
-                _insert_headers(req_hdrs)
-            req_body = raw_flow.get("request_body") or req_obj.get("body") or req_obj.get("content")
-            if req_body:
-                txt.insert(tk.END, "\n" + _format_body(req_body), "body")
-
-            txt.insert(tk.END, "\n" + RULE, "dim")
-            txt.insert(tk.END, "RESPONSE\n", "hdr")
+            req_body = (raw_flow.get("request_body") or
+                        req_obj.get("body") or req_obj.get("content"))
             res_hdrs = raw_flow.get("response_headers") or res_obj.get("headers")
-            if res_hdrs:
-                _insert_headers(res_hdrs)
-            res_body = raw_flow.get("response_body") or res_obj.get("body") or res_obj.get("content")
-            if res_body:
-                txt.insert(tk.END, "\n" + _format_body(res_body), "body")
+            res_body = (raw_flow.get("response_body") or
+                        res_obj.get("body") or res_obj.get("content"))
         else:
-            txt.insert(tk.END, "no raw flow data\n\n", "dim")
-            txt.insert(tk.END, "(network.json missing or flow_id not matched)\n", "dim")
+            # fall back to inline data embedded in the timeline events
+            req_data = (sel.get("req_evt") or {}) if "req_evt" in sel else (
+                sel if sel.get("type") == "network_req" else {})
+            res_data = (sel.get("res_evt") or {}) if "req_evt" in sel else (
+                sel if sel.get("type") == "network_res" else {})
+            req_hdrs = req_data.get("headers") or req_data.get("request_headers")
+            req_body = req_data.get("body") or req_data.get("request_body")
+            res_hdrs = res_data.get("headers") or res_data.get("response_headers")
+            res_body = res_data.get("body") or res_data.get("response_body")
+
+        # ── REQUEST ──────────────────────────────────────────────────────────
+        txt.insert(tk.END, "REQUEST\n", "hdr")
+        # query params always available from URL
+        try:
+            parsed = urlparse(url)
+            txt.insert(tk.END, f"  {parsed.scheme}://{parsed.netloc}{parsed.path}\n", "val")
+            params = parse_qs(parsed.query, keep_blank_values=True)
+            if params:
+                txt.insert(tk.END, "\n  Query params\n", "hdr")
+                for k, vs in params.items():
+                    txt.insert(tk.END, f"  {k}: ", "key")
+                    txt.insert(tk.END, f"{', '.join(vs)}\n", "val")
+        except Exception:
+            pass
+        if req_hdrs:
+            txt.insert(tk.END, "\n  Headers\n", "hdr")
+            _insert_headers(req_hdrs)
+        if req_body:
+            txt.insert(tk.END, "\n" + _format_body(req_body), "body")
+
+        # ── RESPONSE ─────────────────────────────────────────────────────────
+        txt.insert(tk.END, "\n" + RULE, "dim")
+        txt.insert(tk.END, "RESPONSE\n", "hdr")
+        # status + duration always available from res_evt
+        res_data_evt = (sel.get("res_evt") or {}) if "req_evt" in sel else (
+            sel if sel.get("type") == "network_res" else {})
+        res_status  = (res_data_evt.get("status") or status or
+                       (raw_flow.get("response_status") if raw_flow else None))
+        res_dur     = res_data_evt.get("duration_ms")
+        if res_status:
+            stag = "err" if _is_err_status(res_status) else "ok"
+            dur_s = f"  {res_dur}ms" if res_dur else ""
+            txt.insert(tk.END, f"  {res_status}{dur_s}\n", stag)
+        else:
+            txt.insert(tk.END, "  (no response captured)\n", "dim")
+        if res_hdrs:
+            txt.insert(tk.END, "\n  Headers\n", "hdr")
+            _insert_headers(res_hdrs)
+        if res_body:
+            txt.insert(tk.END, "\n" + _format_body(res_body), "body")
+        elif not res_hdrs:
+            txt.insert(tk.END, "  Body not captured.\n", "dim")
 
         txt.configure(state=tk.DISABLED)
         popup.focus_set()
