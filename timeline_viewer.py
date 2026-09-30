@@ -1,19 +1,22 @@
 """
-timeline_viewer.py  —  per-frame recording viewer.
+timeline_viewer.py -- video-editor-style timeline for keytap recordings.
 
 Usage:
     python timeline_viewer.py [recording_dir]
 
-Keyboard: left/right arrows (or buttons) to step through actions.
-Displays the video frame at each action's timestamp alongside its events.
-Falls back to static screenshots for recordings without screen.mp4.
+Keyboard:
+    Left/Right  -- prev/next action
+    Space       -- play/pause
+    Drag sash   -- resize timeline height (PanedWindow sash)
 """
-import base64
 import json
 import os
 import sys
+import tempfile
+import time
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, scrolledtext
+from urllib.parse import urlparse
 
 try:
     import av
@@ -21,6 +24,48 @@ try:
     _AV_OK = True
 except ImportError:
     _AV_OK = False
+
+# ── palette (px0 / Tokyo Night inspired) ─────────────────────────────────────
+
+BG      = "#0d0d0f"    # near-black
+SIDE    = "#111114"    # panels
+FG      = "#e0e0e0"    # high-contrast off-white — readable on any brightness
+DIM     = "#9e9e9e"    # secondary labels — lighter grey, still clearly readable
+BTN     = "#1c1c20"    # button bg
+SEL_BG  = "#dca561"    # highlight bg — bright amber, stands out
+SEL_FG  = "#111111"    # highlight text — dark on bright bg, always readable
+BORDER  = "#222228"    # dividers
+
+FONT    = ("Menlo", 12)
+FONT_SM = ("Menlo", 10)
+
+C_ACTION   = "#e0a060"   # amber — primary accent
+C_NET_REQ  = "#7e9cd8"   # blue-steel
+C_NET_OK   = "#76946a"   # muted green
+C_NET_ERR  = "#c34043"   # muted red
+C_NET_OPEN = "#dca561"   # warm orange (no response)
+C_LOG_E    = "#c34043"
+C_LOG_W    = "#dca561"
+C_LOG_I    = "#52524e"   # dimmed — log info is noise
+C_LOG_D    = "#333330"
+C_PLAYHEAD = "#e0a060"   # amber — matches action accent
+C_RULER_BG = "#090909"
+C_RULER_FG = "#888880"    # axis tick labels — clearly readable
+
+# ── timeline geometry ─────────────────────────────────────────────────────────
+
+TL_MARGIN    = 10
+RULER_H      = 22
+ACTION_Y     = RULER_H + 8
+ACTION_H     = 16
+NET_BASE_Y   = ACTION_Y + ACTION_H + 10
+NET_LANE_H   = 16
+NET_LANE_GAP = 3
+LOG_ABOVE    = 8
+LOG_DOT_R    = 4
+MIN_BAR_W    = 6
+
+_TMP_FRAME = os.path.join(tempfile.gettempdir(), "keytap_frame.ppm")
 
 
 # ── data loading ──────────────────────────────────────────────────────────────
@@ -33,9 +78,9 @@ def load_recording(dir_path: str):
         events = json.load(f).get("events", [])
 
     name = os.path.basename(dir_path)
-    actions_path = os.path.join(dir_path, "actions.json")
-    if os.path.exists(actions_path):
-        with open(actions_path) as f:
+    ap = os.path.join(dir_path, "actions.json")
+    if os.path.exists(ap):
+        with open(ap) as f:
             d = json.load(f)
         name = d.get("name", name)
 
@@ -44,274 +89,902 @@ def load_recording(dir_path: str):
     if os.path.exists(mp4):
         video_path = mp4
 
-    return events, dir_path, name, video_path
+    return events, name, video_path
 
 
-def build_steps(events):
-    """Group events into per-action steps."""
-    action_evts = sorted([e for e in events if e.get("type") == "action"],
-                         key=lambda e: e.get("t", 0))
-    other_evts  = sorted([e for e in events if e.get("type") != "action"],
-                         key=lambda e: e.get("t", 0))
-    steps = []
-    for i, act in enumerate(action_evts):
-        t_start = act.get("t", 0)
-        t_end   = action_evts[i + 1].get("t", float("inf")) if i + 1 < len(action_evts) else float("inf")
-        related = [e for e in other_evts if t_start <= e.get("t", 0) < t_end]
-        steps.append({"action": act, "events": related})
-    return steps
+def total_duration_ms(events, video_path=None):
+    dur = 0
+    if video_path and _AV_OK:
+        try:
+            c = av.open(video_path)
+            if c.duration:
+                dur = int(c.duration / 1000)
+            c.close()
+        except Exception:
+            pass
+    if not dur and events:
+        dur = max(e.get("t", 0) for e in events) + 2000
+    return max(dur, 5000)
+
+
+# ── network flow pairing ──────────────────────────────────────────────────────
+
+def build_net_flows(events):
+    req_by_id = {}
+    req_no_id = []
+    res_by_id = {}
+    res_no_id = []
+
+    for e in events:
+        fid = e.get("flow_id")
+        if e.get("type") == "network_req":
+            if fid:
+                req_by_id[fid] = e
+            else:
+                req_no_id.append(e)
+        elif e.get("type") == "network_res":
+            if fid:
+                res_by_id[fid] = e
+            else:
+                res_no_id.append(e)
+
+    flows = []
+    for fid, req in req_by_id.items():
+        flows.append(_make_flow(req, res_by_id.pop(fid, None)))
+    for res in res_by_id.values():
+        flows.append(_make_flow(None, res))
+
+    used = set()
+    for req in req_no_id:
+        matched = None
+        for i, res in enumerate(res_no_id):
+            if i in used:
+                continue
+            if (res.get("method") == req.get("method") and
+                    res.get("url") == req.get("url") and
+                    res.get("t", 0) >= req.get("t", 0)):
+                matched = res
+                used.add(i)
+                break
+        flows.append(_make_flow(req, matched))
+
+    flows.sort(key=lambda f: f["t_req"])
+    lane_ends = []
+    for f in flows:
+        t_s = f["t_req"]
+        t_e = f["t_res"] if f["t_res"] is not None else t_s + 100
+        placed = False
+        for i, end_t in enumerate(lane_ends):
+            if t_s >= end_t:
+                f["lane"] = i
+                lane_ends[i] = t_e
+                placed = True
+                break
+        if not placed:
+            f["lane"] = len(lane_ends)
+            lane_ends.append(t_e)
+
+    return flows
+
+
+def _make_flow(req, res):
+    t_req  = req.get("t", 0) if req else (res.get("t", 0) if res else 0)
+    t_res  = res.get("t") if res else None
+    status = res.get("status") if res else None
+    try:
+        color = C_NET_OK if int(status) < 400 else C_NET_ERR
+    except (TypeError, ValueError):
+        color = C_NET_OPEN if t_res is None else C_NET_OK
+    return {
+        "t_req":   t_req,
+        "t_res":   t_res,
+        "method":  (req or res or {}).get("method", "?"),
+        "url":     (req or res or {}).get("url", "?"),
+        "status":  status,
+        "color":   color,
+        "req_evt": req,
+        "res_evt": res,
+        "lane":    0,
+    }
 
 
 # ── video frame extraction ────────────────────────────────────────────────────
 
-def _frame_at_ms(container, t_ms: int):
-    """Seek to t_ms and decode forward to the correct frame."""
-    stream = container.streams.video[0]
-    t_target_s = t_ms / 1000.0
+def frame_at_ms(video_path: str, t_ms: int):
+    if not _AV_OK:
+        return None
+    container = None
     try:
-        container.seek(t_ms * 1000, backward=True)
-    except Exception:
+        container = av.open(video_path)
+        stream = container.streams.video[0]
+        t_target_s = t_ms / 1000.0
         try:
-            container.seek(0)
+            container.seek(t_ms * 1000, backward=True)
         except Exception:
-            pass
-    # backward=True lands on the nearest keyframe before t_ms.
-    # Decode forward until we reach or pass the target timestamp.
-    best = None
-    for frame in container.decode(stream):
-        best = frame
-        if frame.time >= t_target_s:
-            break
-    if best is None:
-        return None, 0, 0
-    return best.to_ndarray(format="rgb24"), best.width, best.height
-
-
-def _arr_to_photoimage(arr, target_h: int = 560):
-    """Convert numpy RGB24 array to tk.PhotoImage via base64-encoded PPM."""
-    H, W = arr.shape[:2]
-    if H > target_h:
-        scale = max(1, H // target_h)
-        arr = arr[::scale, ::scale]
+            try:
+                container.seek(0)
+            except Exception:
+                pass
+        best = None
+        for frame in container.decode(stream):
+            best = frame
+            if frame.time >= t_target_s:
+                break
+        if best is None:
+            return None
+        arr = best.to_ndarray(format="rgb24")
         H, W = arr.shape[:2]
-    ppm = f"P6\n{W} {H}\n255\n".encode() + arr.tobytes()
-    return tk.PhotoImage(data=base64.b64encode(ppm).decode("ascii"))
+        if H > 560:
+            scale = max(1, H // 560)
+            arr = arr[::scale, ::scale]
+            H, W = arr.shape[:2]
+        ppm = f"P6\n{W} {H}\n255\n".encode() + arr.tobytes()
+        with open(_TMP_FRAME, "wb") as fh:
+            fh.write(ppm)
+        return tk.PhotoImage(file=_TMP_FRAME)
+    except Exception:
+        return None
+    finally:
+        if container:
+            try:
+                container.close()
+            except Exception:
+                pass
 
 
-# ── event formatting ──────────────────────────────────────────────────────────
+# ── formatting helpers ────────────────────────────────────────────────────────
 
-_COLORS = {
-    "action":      ("#4fc3f7", True),
-    "log_E":       ("#ef5350", False),
-    "log_W":       ("#ffa726", False),
-    "log_I":       ("#aed581", False),
-    "log_?":       ("#b0bec5", False),
-    "network_req": ("#ce93d8", False),
-    "network_res": ("#80cbc4", False),
-}
+def fmt_ms(t_ms: int) -> str:
+    return f"{t_ms / 1000:.1f}s"
 
 
-def fmt(evt):
-    t   = evt.get("t", 0)
+def fmt_url(url: str, max_len: int = 52) -> str:
+    try:
+        parsed = urlparse(url)
+        path = parsed.path or "/"
+        if parsed.query and len(parsed.query) <= 24:
+            path = path + "?" + parsed.query
+    except Exception:
+        path = url
+    if len(path) > max_len:
+        head = 20
+        tail = max_len - head - 1
+        path = path[:head] + "\u2026" + path[-tail:]
+    return path
+
+
+def fmt_event(evt):
+    t   = fmt_ms(evt.get("t", 0))
     typ = evt.get("type", "?")
     if typ == "action":
-        return (f"  [{t:>6}ms]  ACTION  {evt.get('action_type','?')}  {evt.get('hint','')}",
-                "action")
+        at   = evt.get("action_type", "?")
+        hint = evt.get("hint", "")
+        return (f"{t}   {at}  {hint}", "action")
     elif typ == "log":
         lvl = evt.get("level", "?")
-        return (f"  [{t:>6}ms]  {lvl}/{evt.get('tag','?')}: {evt.get('msg','')}",
-                f"log_{lvl}" if f"log_{lvl}" in _COLORS else "log_?")
+        tag = {"E": "log_E", "W": "log_W", "I": "log_I"}.get(lvl, "log_D")
+        return (f"{t}   {lvl}/{evt.get('tag','?')}: {evt.get('msg','')}", tag)
     elif typ == "network_req":
-        return (f"  [{t:>6}ms]  --> {evt.get('method','?')} {evt.get('url','?')}",
-                "network_req")
+        path = fmt_url(evt.get("url", "?"))
+        return (f"{t}   {evt.get('method','?')}  {path}", "net_req")
     elif typ == "network_res":
-        dur = evt.get("duration_ms")
-        dur_s = f" ({dur}ms)" if dur is not None else ""
-        return (f"  [{t:>6}ms]  <-- {evt.get('status','?')} {evt.get('method','?')} {evt.get('url','?')}{dur_s}",
-                "network_res")
-    return f"  [{t:>6}ms]  {typ}", "log_?"
+        path = fmt_url(evt.get("url", "?"))
+        dur  = evt.get("duration_ms")
+        dur_s = f"  ({dur}ms)" if dur is not None else ""
+        st   = evt.get("status", "?")
+        tag  = "net_err" if _is_err_status(st) else "net_res"
+        return (f"{t}   {st}  {evt.get('method','?')}  {path}{dur_s}", tag)
+    return (f"{t}   {typ}", "log_D")
 
 
-# ── viewer ────────────────────────────────────────────────────────────────────
+def _is_err_status(st):
+    try:
+        return int(st) >= 400
+    except (TypeError, ValueError):
+        return False
 
-BG   = "#1e1e2e"
-SIDE = "#181825"
-FG   = "#cdd6f4"
-DIM  = "#6c7086"
-BTN  = "#313244"
-FONT = ("Menlo", 11)
 
+# ── timeline canvas ───────────────────────────────────────────────────────────
+
+class _TimelineCanvas(tk.Canvas):
+
+    def __init__(self, parent, events, net_flows, total_ms,
+                 on_seek, on_select_event, **kw):
+        n = max((f["lane"] for f in net_flows), default=-1) + 1 if net_flows else 1
+        self._n_lanes = max(n, 1)
+        super().__init__(parent, bg=SIDE, highlightthickness=0, **kw)
+
+        self._events    = events
+        self._net_flows = net_flows
+        self._total_ms  = max(total_ms, 1)
+        self._on_seek   = on_seek
+        self._on_select = on_select_event
+        self._playhead  = 0
+        self._selected  = None
+
+        self._actions = sorted(
+            [e for e in events if e.get("type") == "action"],
+            key=lambda e: e.get("t", 0),
+        )
+        self._logs = sorted(
+            [e for e in events if e.get("type") == "log"],
+            key=lambda e: e.get("t", 0),
+        )
+
+        self.bind("<Configure>", lambda _: self._draw())
+        self.bind("<Button-1>",  self._on_click)
+        self.bind("<B1-Motion>", self._on_drag)
+
+    def set_playhead(self, t_ms: int):
+        self._playhead = t_ms
+        self._draw()
+
+    def _t2x(self, t_ms):
+        w = self.winfo_width() or 800
+        return TL_MARGIN + (t_ms / self._total_ms) * (w - 2 * TL_MARGIN)
+
+    def _x2t(self, x):
+        w = self.winfo_width() or 800
+        ratio = (x - TL_MARGIN) / max(w - 2 * TL_MARGIN, 1)
+        return int(max(0, min(self._total_ms, ratio * self._total_ms)))
+
+    def _on_click(self, e):
+        hits = self.find_overlapping(e.x - 5, e.y - 5, e.x + 5, e.y + 5)
+        for item in hits:
+            for tag in self.gettags(item):
+                if tag.startswith("net:"):
+                    idx = int(tag[4:])
+                    self._selected = ("net", idx)
+                    self._draw()
+                    if self._on_select:
+                        t = self._net_flows[idx]["t_req"]
+                        self._on_select(self._net_flows[idx], t)
+                    return
+                if tag.startswith("act:"):
+                    idx = int(tag[4:])
+                    self._selected = ("act", idx)
+                    self._draw()
+                    if self._on_select:
+                        t = self._actions[idx].get("t", 0)
+                        self._on_select(self._actions[idx], t)
+                    return
+        self._seek_to(self._x2t(e.x))
+
+    def _on_drag(self, e):
+        self._seek_to(self._x2t(e.x))
+
+    def _seek_to(self, t_ms):
+        self._playhead = t_ms
+        self._draw()
+        if self._on_seek:
+            self._on_seek(t_ms)
+
+    def _draw(self):
+        self.delete("all")
+        self._draw_ruler()
+        self._draw_actions()
+        self._draw_network()
+        self._draw_logs()
+        self._draw_playhead()
+
+    def _draw_ruler(self):
+        w = self.winfo_width() or 800
+        self.create_rectangle(0, 0, w, RULER_H, fill=C_RULER_BG, outline="")
+        usable    = w - 2 * TL_MARGIN
+        px_per_ms = usable / self._total_ms if self._total_ms else 1
+        for iv in [200, 500, 1000, 2000, 5000, 10000, 30000]:
+            if iv * px_per_ms >= 50:
+                tick_ms = iv
+                break
+        else:
+            tick_ms = 30000
+        t = 0
+        while t <= self._total_ms:
+            x = self._t2x(t)
+            self.create_line(x, RULER_H - 5, x, RULER_H, fill=C_RULER_FG)
+            label = f"{t / 1000:.0f}s" if t % 1000 == 0 else f"{t / 1000:.1f}s"
+            self.create_text(x, RULER_H // 2, text=label, fill=C_RULER_FG,
+                             font=FONT_SM, anchor=tk.CENTER)
+            t += tick_ms
+
+    def _draw_actions(self):
+        prev_label_x = -100
+        for i, evt in enumerate(self._actions):
+            t = evt.get("t", 0)
+            x = self._t2x(t)
+            y = ACTION_Y
+            is_sel = self._selected == ("act", i)
+            r    = 9 if is_sel else 7
+            fill = "#f0c882" if is_sel else C_ACTION
+            self.create_polygon(
+                [x, y, x + r, y + r, x, y + 2 * r, x - r, y + r],
+                fill=fill, outline=BORDER, width=1,
+                tags=(f"act:{i}",),
+            )
+            label = (evt.get("hint") or evt.get("action_type") or "A")[:12]
+            if x - prev_label_x > 60:
+                self.create_text(x, y - 4, text=label, fill=C_ACTION,
+                                 font=FONT_SM, anchor=tk.S,
+                                 tags=(f"act:{i}",))
+                prev_label_x = x
+
+    def _draw_network(self):
+        for i, flow in enumerate(self._net_flows):
+            y  = NET_BASE_Y + flow["lane"] * (NET_LANE_H + NET_LANE_GAP)
+            x1 = self._t2x(flow["t_req"])
+            x2 = (max(x1 + MIN_BAR_W, self._t2x(flow["t_res"]))
+                  if flow["t_res"] is not None else x1 + MIN_BAR_W)
+            is_sel = self._selected == ("net", i)
+            self.create_rectangle(
+                x1, y, x2, y + NET_LANE_H,
+                fill=flow["color"],
+                outline=FG if is_sel else BORDER,
+                width=1,
+                tags=(f"net:{i}",),
+            )
+            if flow["t_res"] is None:
+                self.create_line(x2, y + NET_LANE_H // 2,
+                                 x2 + 8, y + NET_LANE_H // 2,
+                                 fill=C_NET_OPEN, arrow=tk.LAST,
+                                 tags=(f"net:{i}",))
+            if x2 - x1 > 32:
+                self.create_text(x1 + 4, y + NET_LANE_H // 2,
+                                 text=flow.get("method", "")[:4],
+                                 fill=BG, font=FONT_SM, anchor=tk.W,
+                                 tags=(f"net:{i}",))
+
+    def _draw_logs(self):
+        net_h = self._n_lanes * (NET_LANE_H + NET_LANE_GAP)
+        log_y = NET_BASE_Y + net_h + LOG_ABOVE + LOG_DOT_R
+        for evt in self._logs:
+            lvl = evt.get("level", "?")
+            if lvl not in ("E", "W"):
+                continue
+            x     = self._t2x(evt.get("t", 0))
+            color = C_LOG_E if lvl == "E" else C_LOG_W
+            self.create_oval(x - LOG_DOT_R, log_y - LOG_DOT_R,
+                             x + LOG_DOT_R, log_y + LOG_DOT_R,
+                             fill=color, outline="")
+
+    def _draw_playhead(self):
+        x = self._t2x(self._playhead)
+        h = self.winfo_height() or 200
+        self.create_line(x, 0, x, h, fill=C_PLAYHEAD, width=1)
+        self.create_polygon([x - 5, 0, x + 5, 0, x, 9],
+                            fill=C_PLAYHEAD, outline="")
+
+
+# ── main viewer ───────────────────────────────────────────────────────────────
 
 class TimelineViewer:
 
     def __init__(self, root: tk.Tk, dir_path: str):
-        self.root      = root
-        self.steps     = []
-        self.idx       = 0
+        self.root        = root
+        self._events     = []
+        self._net_flows  = []
+        self._total_ms   = 60000
+        self._video_path = None
+        self._playhead   = 0
+        self._playing    = False
+        self._play_wall  = 0.0
+        self._play_start = 0
         self._img        = None
-        self._video_path = None   # path to screen.mp4; open fresh per seek
+        self._tl_canvas  = None
+        self._tl_frame   = None   # bottom pane of PanedWindow
+        self._selected_event = None  # flow dict or event dict (last explicit selection)
+        self._row_to_event: dict = {}  # text line_no → event dict
+        self._network_raw: dict = {}   # flow_id → raw flow from network.json
 
-        root.title("keytap  |  timeline viewer")
+        root.title("keytap  |  timeline")
         root.configure(bg=BG)
-        root.minsize(900, 640)
+        root.minsize(1000, 680)
+        root.bind("<Left>",   lambda _: self._prev_action())
+        root.bind("<Right>",  lambda _: self._next_action())
+        root.bind("<space>",  lambda _: self._toggle_play())
+        root.bind("<Return>", lambda _: self._on_expand())
 
         self._build_ui()
         self._load(dir_path)
-        root.bind("<Left>",  lambda _: self._nav(-1))
-        root.bind("<Right>", lambda _: self._nav(+1))
-        root.protocol("WM_DELETE_WINDOW", self._on_close)
-
-    def _on_close(self):
-        self.root.destroy()
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
+        # Top bar
         bar = tk.Frame(self.root, bg=SIDE, pady=6)
-        bar.pack(fill=tk.X)
+        bar.pack(fill=tk.X, side=tk.TOP)
 
         self.lbl_title = tk.Label(bar, text="", bg=SIDE, fg=FG,
                                   font=("Menlo", 13, "bold"))
         self.lbl_title.pack(side=tk.LEFT, padx=12)
 
-        for text, delta in [("◀  Prev", -1), ("Next  ▶", +1)]:
-            tk.Button(bar, text=text, command=lambda d=delta: self._nav(d),
+        self.lbl_time = tk.Label(bar, text="0.0s / 0.0s", bg=SIDE, fg=DIM, font=FONT)
+        self.lbl_time.pack(side=tk.LEFT, padx=8)
+
+        self.btn_play = tk.Button(bar, text="▶  Play", command=self._toggle_play,
+                                  bg=BTN, fg=FG, relief=tk.FLAT,
+                                  padx=10, pady=4, font=FONT)
+        self.btn_play.pack(side=tk.RIGHT, padx=4)
+
+        for text, fn in [("Next Action ▶", self._next_action),
+                         ("◀ Prev Action", self._prev_action)]:
+            tk.Button(bar, text=text, command=fn,
                       bg=BTN, fg=FG, relief=tk.FLAT,
-                      padx=10, pady=4, font=FONT).pack(side=tk.RIGHT, padx=4)
+                      padx=10, pady=4, font=FONT).pack(side=tk.RIGHT, padx=2)
 
-        self.lbl_step = tk.Label(bar, text="", bg=SIDE, fg=DIM, font=FONT)
-        self.lbl_step.pack(side=tk.RIGHT, padx=12)
+        tk.Frame(self.root, bg=BORDER, height=1).pack(fill=tk.X, side=tk.TOP)
 
-        main = tk.Frame(self.root, bg=BG)
-        main.pack(fill=tk.BOTH, expand=True)
+        # Vertical PanedWindow: main content (top) | timeline (bottom)
+        paned = tk.PanedWindow(
+            self.root, orient=tk.VERTICAL,
+            bg=BORDER,
+            sashwidth=5,
+            sashrelief=tk.FLAT,
+            sashpad=0,
+            showhandle=False,
+        )
+        paned.pack(fill=tk.BOTH, expand=True)
 
-        ss_frame = tk.Frame(main, bg=BG, width=300)
-        ss_frame.pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=10)
-        ss_frame.pack_propagate(False)
+        # ── top pane: video + events ─────────────────────────────────────────
+        main = tk.Frame(paned, bg=BG)
+        paned.add(main, minsize=200, stretch="always")
 
-        self.ss_lbl = tk.Label(ss_frame, bg=SIDE, text="no frame",
-                               fg=DIM, font=FONT)
-        self.ss_lbl.pack(fill=tk.BOTH, expand=True)
+        vid_outer = tk.Frame(main, bg=BG)
+        vid_outer.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.lbl_frame = tk.Label(vid_outer, bg=SIDE, text="no frame",
+                                  fg=DIM, font=FONT)
+        self.lbl_frame.pack(fill=tk.BOTH, expand=True)
 
-        ev = tk.Frame(main, bg=BG)
-        ev.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10), pady=10)
+        tk.Frame(main, bg=BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y)
 
-        tk.Label(ev, text="Events", bg=BG, fg=DIM, font=FONT).pack(anchor=tk.W, pady=(0, 4))
+        ev_outer = tk.Frame(main, bg=BG, width=420)
+        ev_outer.pack(side=tk.RIGHT, fill=tk.Y)
+        ev_outer.pack_propagate(False)
 
-        self.txt = tk.Text(ev, bg=SIDE, fg=FG, font=FONT,
-                           relief=tk.FLAT, wrap=tk.WORD,
-                           state=tk.DISABLED, cursor="arrow")
-        sb = tk.Scrollbar(ev, command=self.txt.yview)
+        ev_header = tk.Frame(ev_outer, bg=SIDE, pady=6)
+        ev_header.pack(fill=tk.X)
+        tk.Label(ev_header, text="Events", bg=SIDE, fg=DIM,
+                 font=FONT, padx=12).pack(side=tk.LEFT)
+        tk.Frame(ev_outer, bg=BORDER, height=1).pack(fill=tk.X)
+
+        self.txt = tk.Text(
+            ev_outer, bg=SIDE, fg=FG, font=FONT,
+            relief=tk.FLAT, wrap=tk.CHAR,
+            state=tk.DISABLED, cursor="arrow",
+            padx=12, pady=10, spacing1=1, spacing3=3,
+        )
+        sb = tk.Scrollbar(ev_outer, command=self.txt.yview,
+                          bg=BTN, troughcolor=SIDE)
         self.txt.configure(yscrollcommand=sb.set)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.txt.pack(fill=tk.BOTH, expand=True)
 
-        for key, (color, bold) in _COLORS.items():
-            self.txt.tag_configure(key, foreground=color,
-                                   font=("Menlo", 11, "bold" if bold else "normal"))
+        for tag, fg_color, bold in [
+            ("action",  C_ACTION,  True),
+            ("net_req", C_NET_REQ, False),
+            ("net_res", C_NET_OK,  False),
+            ("net_err", C_NET_ERR, False),
+            ("log_E",   C_LOG_E,   False),
+            ("log_W",   C_LOG_W,   False),
+            ("log_I",   C_LOG_I,   False),
+            ("log_D",   C_LOG_D,   False),
+            ("dim",     DIM,       False),
+            ("section", DIM,       False),
+        ]:
+            fnt = ("Menlo", 12, "bold") if bold else FONT
+            self.txt.tag_configure(tag, foreground=fg_color, font=fnt)
+        self.txt.tag_configure("section", font=("Menlo", 10))
+        # Highlight: bright amber bg + dark text. tag_raise ensures it wins
+        # over any per-event color tag regardless of configuration order.
+        self.txt.tag_configure("cur_bg",
+                               background=SEL_BG,
+                               foreground=SEL_FG,
+                               font=("Menlo", 12, "bold"))
+        self.txt.tag_raise("cur_bg")
+        self.txt.bind("<Button-1>",        self._on_txt_click)
+        self.txt.bind("<Double-Button-1>", self._on_txt_double_click)
+
+        # ── bottom pane: timeline ─────────────────────────────────────────────
+        self._tl_frame = tk.Frame(paned, bg=SIDE)
+        paned.add(self._tl_frame, minsize=70, height=140, stretch="never")
+
+    def _build_timeline(self):
+        if self._tl_canvas:
+            self._tl_canvas.destroy()
+        self._tl_canvas = _TimelineCanvas(
+            self._tl_frame, self._events, self._net_flows, self._total_ms,
+            on_seek=self._seek,
+            on_select_event=self._on_select_event,
+        )
+        self._tl_canvas.pack(fill=tk.BOTH, expand=True)
 
     # ── load ──────────────────────────────────────────────────────────────────
 
     def _load(self, dir_path: str):
         try:
-            events, self.dir_path, name, video_path = load_recording(dir_path)
+            events, name, video_path = load_recording(dir_path)
         except Exception as e:
             self.lbl_title.configure(text=str(e))
             return
 
-        if video_path:
-            if _AV_OK:
-                self._video_path = video_path
-            else:
-                self.ss_lbl.configure(text="install PyAV to enable video\n(pip install av)")
+        self._events     = events
+        self._video_path = video_path if (_AV_OK and video_path) else None
+        self._net_flows  = build_net_flows(events)
+        self._total_ms   = total_duration_ms(events, video_path)
+        self._selected_event = None
+        self._network_raw = {}
+        net_path = os.path.join(dir_path, "network.json")
+        if os.path.exists(net_path):
+            try:
+                with open(net_path) as f:
+                    data = json.load(f)
+                flows = data if isinstance(data, list) else data.get("flows", [])
+                self._network_raw = {
+                    str(fl.get("id")): fl for fl in flows if fl.get("id")
+                }
+            except Exception:
+                pass
 
-        self.steps = build_steps(events)
         self.lbl_title.configure(text=name)
-        self.idx = 0
-        self._render()
+        if not _AV_OK:
+            self.lbl_frame.configure(text="install PyAV to enable video\n(pip install av)")
 
-    # ── nav / render ──────────────────────────────────────────────────────────
+        self._build_timeline()
+        self._seek(0)
 
-    def _nav(self, delta: int):
-        if not self.steps:
-            return
-        self.idx = max(0, min(len(self.steps) - 1, self.idx + delta))
-        self._render()
+    # ── seek / nav / play ─────────────────────────────────────────────────────
 
-    def _render(self):
-        if not self.steps:
-            return
-        step = self.steps[self.idx]
-        act  = step["action"]
+    def _seek(self, t_ms: int):
+        self._playhead = max(0, min(self._total_ms, int(t_ms)))
+        self.lbl_time.configure(
+            text=f"{self._playhead / 1000:.1f}s / {self._total_ms / 1000:.1f}s"
+        )
+        if self._tl_canvas:
+            self._tl_canvas.set_playhead(self._playhead)
+        self._update_frame()
+        self._update_events()
 
-        self.lbl_step.configure(text=f"Step {self.idx + 1} / {len(self.steps)}")
+    def _prev_action(self):
+        self._selected_event = None
+        acts = sorted([e for e in self._events if e.get("type") == "action"],
+                      key=lambda e: e.get("t", 0))
+        for a in reversed(acts):
+            if a.get("t", 0) < self._playhead - 50:
+                self._seek(a["t"])
+                return
 
-        # frame
-        if self._video_path:
-            self._show_video_frame(act.get("t", 0))
-        elif act.get("screenshot"):
-            self._show_screenshot(os.path.join(self.dir_path, act["screenshot"]))
+    def _next_action(self):
+        self._selected_event = None
+        acts = sorted([e for e in self._events if e.get("type") == "action"],
+                      key=lambda e: e.get("t", 0))
+        for a in acts:
+            if a.get("t", 0) > self._playhead + 50:
+                self._seek(a["t"])
+                return
+
+    def _toggle_play(self):
+        if self._playing:
+            self._playing = False
+            self.btn_play.configure(text="▶  Play")
         else:
-            self.ss_lbl.configure(image="", text="no frame")
-            self._img = None
+            if self._playhead >= self._total_ms:
+                self._playhead = 0
+            self._playing    = True
+            self._play_wall  = time.time()
+            self._play_start = self._playhead
+            self.btn_play.configure(text="⏸  Pause")
+            self._tick()
 
-        # events
+    def _tick(self):
+        if not self._playing:
+            return
+        elapsed = int((time.time() - self._play_wall) * 1000)
+        t = self._play_start + elapsed
+        if t >= self._total_ms:
+            self._seek(self._total_ms)
+            self._playing = False
+            self.btn_play.configure(text="▶  Play")
+            return
+        self._seek(t)
+        self.root.after(40, self._tick)
+
+    def _on_select_event(self, item, t_ms: int):
+        self._selected_event = item
+        self._seek(t_ms)
+
+    # ── frame display ─────────────────────────────────────────────────────────
+
+    def _update_frame(self):
+        if self._video_path:
+            img = frame_at_ms(self._video_path, self._playhead)
+            if img is None:
+                self.lbl_frame.configure(image="",
+                                         text=f"no frame @ {fmt_ms(self._playhead)}")
+                self._img = None
+            else:
+                self._img = img
+                self.lbl_frame.configure(image=img, text="")
+            return
+
+        best = None
+        for e in self._events:
+            if (e.get("type") == "action" and
+                    e.get("t", 0) <= self._playhead and e.get("screenshot")):
+                best = e["screenshot"]
+        if best and os.path.exists(best):
+            try:
+                img = tk.PhotoImage(file=best)
+                if img.height() > 560:
+                    factor = max(1, img.height() // 560)
+                    img = img.subsample(factor, factor)
+                self._img = img
+                self.lbl_frame.configure(image=img, text="")
+                return
+            except Exception:
+                pass
+        self.lbl_frame.configure(image="", text="no frame")
+        self._img = None
+
+    # ── events panel ─────────────────────────────────────────────────────────
+
+    def _update_events(self):
+        selected = self._selected_event
+        acts = sorted([e for e in self._events if e.get("type") == "action"],
+                      key=lambda e: e.get("t", 0))
+        t_start, t_end = 0, self._total_ms
+        for i, a in enumerate(acts):
+            if a.get("t", 0) <= self._playhead:
+                t_start = a.get("t", 0)
+                t_end   = (acts[i + 1].get("t", self._total_ms)
+                           if i + 1 < len(acts) else self._total_ms)
+
+        window = sorted(
+            [e for e in self._events if t_start <= e.get("t", 0) <= t_end],
+            key=lambda e: e.get("t", 0),
+        )
+
+        self._row_to_event = {}
         self.txt.configure(state=tk.NORMAL)
         self.txt.delete("1.0", tk.END)
 
-        text, ckey = fmt(act)
-        self.txt.insert(tk.END, text + "\n", ckey)
-        self.txt.insert(tk.END, "\n")
+        RULE = "\u2500" * 44 + "\n"
 
-        if step["events"]:
-            self.txt.insert(tk.END, "  -- related events --\n\n", "log_?")
-            for evt in step["events"]:
-                text, ckey = fmt(evt)
-                self.txt.insert(tk.END, text + "\n", ckey)
-        else:
-            self.txt.insert(tk.END, "  (no log / network events for this step)\n", "log_?")
+        # ── selected item header (from timeline / panel click) ────────────────
+        if selected is not None:
+            if "req_evt" in selected:
+                req = selected.get("req_evt")
+                res = selected.get("res_evt")
+                self.txt.insert(tk.END, "  SELECTED CALL  (Enter to expand)\n", "section")
+                self.txt.insert(tk.END, "\n")
+                if req:
+                    method = req.get("method", "?")
+                    path   = fmt_url(req.get("url", "?"), max_len=62)
+                    self.txt.insert(tk.END, f"  {method}  {path}\n", "net_req")
+                if res:
+                    st    = res.get("status", "?")
+                    dur   = (res.get("t", 0) - req.get("t", 0)) if req else None
+                    tag   = "net_err" if _is_err_status(st) else "net_res"
+                    dur_s = f"  ({dur}ms)" if dur is not None else ""
+                    self.txt.insert(tk.END, f"  {st}{dur_s}\n", tag)
+                    self.txt.insert(tk.END, f"\n  {selected.get('url','')}\n", "dim")
+                else:
+                    self.txt.insert(tk.END, "  no response captured\n", "dim")
+                self.txt.insert(tk.END, "\n" + RULE + "\n", "section")
+            elif selected.get("type") in ("network_req", "network_res"):
+                line_s, tag_s = fmt_event(selected)
+                self.txt.insert(tk.END, "  SELECTED  (Enter to expand)\n\n", "section")
+                self.txt.insert(tk.END, f"  {line_s}\n\n", tag_s)
+                self.txt.insert(tk.END, RULE + "\n", "section")
+            else:
+                line_s, tag_s = fmt_event(selected)
+                self.txt.insert(tk.END, "  SELECTED\n\n", "section")
+                self.txt.insert(tk.END, f"  {line_s}\n\n", tag_s)
+                self.txt.insert(tk.END, RULE + "\n", "section")
+
+        # ── step window ───────────────────────────────────────────────────────
+        self.txt.insert(tk.END,
+                        f"  {fmt_ms(t_start)}  \u2192  {fmt_ms(t_end)}\n\n",
+                        "section")
+
+        prev_type  = None
+        scroll_line = None  # line to scroll to (selected event in list)
+
+        # identities of the selected event(s) for highlight
+        sel_ids = set()
+        if selected is not None:
+            if "req_evt" in selected:
+                if selected.get("req_evt") is not None:
+                    sel_ids.add(id(selected["req_evt"]))
+                if selected.get("res_evt") is not None:
+                    sel_ids.add(id(selected["res_evt"]))
+            else:
+                sel_ids.add(id(selected))
+
+        for evt in window:
+            typ = evt.get("type", "?")
+            if prev_type and typ != prev_type:
+                self.txt.insert(tk.END, "\n")
+            prev_type = typ
+
+            row_line = int(self.txt.index(tk.END).split(".")[0])
+            self._row_to_event[row_line] = evt
+
+            line, tag = fmt_event(evt)
+            near      = abs(evt.get("t", 0) - self._playhead) <= 400
+            is_sel    = id(evt) in sel_ids
+
+            if is_sel:
+                scroll_line = row_line
+                tags = (tag, "cur_bg")
+            elif near:
+                tags = (tag, "cur_bg")
+            else:
+                tags = (tag,)
+
+            self.txt.insert(tk.END, f"  {line}\n", tags)
 
         self.txt.configure(state=tk.DISABLED)
 
-    def _show_video_frame(self, t_ms: int):
-        # Open fresh container per seek — avoids stale decoder state
-        container = None
-        try:
-            container = av.open(self._video_path)
-            arr, w, h = _frame_at_ms(container, t_ms)
-            if arr is None:
-                self.ss_lbl.configure(image="", text=f"no frame @ {t_ms}ms")
-                self._img = None
-                return
-            img = _arr_to_photoimage(arr)
-            self._img = img
-            self.ss_lbl.configure(image=img, text="")
-        except Exception as e:
-            self.ss_lbl.configure(image="", text=f"error: {e}")
-            self._img = None
-        finally:
-            if container:
-                try:
-                    container.close()
-                except Exception:
-                    pass
+        # scroll to selected event row; fall back to top (shows SELECTED block)
+        if scroll_line is not None:
+            self.txt.see(f"{scroll_line}.0")
+        elif selected is not None:
+            self.txt.see("1.0")
 
-    def _show_screenshot(self, path: str):
-        if not os.path.exists(path):
-            self.ss_lbl.configure(image="", text="screenshot missing")
-            self._img = None
-            return
+
+    # ── right panel interaction ───────────────────────────────────────────────
+
+    def _on_txt_click(self, _event):
+        # after_idle so tkinter has resolved the click position
+        self.txt.after_idle(self._handle_txt_click)
+
+    def _handle_txt_click(self):
         try:
-            img = tk.PhotoImage(file=path)
-            w, h = img.width(), img.height()
-            if h > 560:
-                factor = max(1, h // 560)
-                img = img.subsample(factor, factor)
-            self._img = img
-            self.ss_lbl.configure(image=img, text="")
-        except Exception as e:
-            self.ss_lbl.configure(image="", text=f"error: {e}")
-            self._img = None
+            idx = self.txt.index(tk.INSERT)
+        except Exception:
+            return
+        line = int(idx.split(".")[0])
+        evt = self._row_to_event.get(line)
+        if evt is not None:
+            self._selected_event = evt
+            self._seek(evt.get("t", 0))
+
+    def _on_txt_double_click(self, _event):
+        self.txt.after_idle(self._handle_txt_double)
+        return "break"  # prevent default word-selection
+
+    def _handle_txt_double(self):
+        try:
+            idx = self.txt.index(tk.INSERT)
+        except Exception:
+            return
+        line = int(idx.split(".")[0])
+        evt = self._row_to_event.get(line)
+        if evt is not None:
+            self._selected_event = evt
+            self._on_expand()
+
+    def _on_expand(self):
+        """Open network detail popup for the currently selected event."""
+        sel = self._selected_event
+        if sel is None:
+            return
+        # flow dict (from timeline bar click)
+        if "req_evt" in sel:
+            req = sel.get("req_evt") or {}
+            res = sel.get("res_evt") or {}
+            fid = req.get("flow_id") or res.get("flow_id")
+        # raw event dict
+        elif sel.get("type") in ("network_req", "network_res"):
+            fid = sel.get("flow_id")
+        else:
+            return
+        raw = self._network_raw.get(str(fid)) if fid else None
+        self._open_flow_popup(sel, raw)
+
+    def _open_flow_popup(self, sel, raw_flow):
+        popup = tk.Toplevel(self.root)
+        popup.title("Network Flow")
+        popup.configure(bg=BG)
+        popup.geometry("760x540")
+        popup.bind("<Escape>", lambda _: popup.destroy())
+        popup.bind("<Return>", lambda _: popup.destroy())
+
+        txt = scrolledtext.ScrolledText(
+            popup, bg=SIDE, fg=FG, font=FONT,
+            relief=tk.FLAT, padx=16, pady=12,
+            wrap=tk.CHAR,
+        )
+        txt.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
+
+        txt.tag_configure("hdr",    foreground=DIM,      font=("Menlo", 10))
+        txt.tag_configure("method", foreground=C_ACTION, font=("Menlo", 13, "bold"))
+        txt.tag_configure("ok",     foreground=C_NET_OK, font=("Menlo", 12, "bold"))
+        txt.tag_configure("err",    foreground=C_NET_ERR, font=("Menlo", 12, "bold"))
+        txt.tag_configure("key",    foreground=C_NET_REQ, font=FONT)
+        txt.tag_configure("val",    foreground=FG,        font=FONT)
+        txt.tag_configure("body",   foreground=FG,        font=("Menlo", 11))
+        txt.tag_configure("dim",    foreground=DIM,       font=FONT_SM)
+
+        RULE = "\u2500" * 62 + "\n"
+
+        # extract summary fields
+        if "req_evt" in sel:
+            req_evt = sel.get("req_evt") or {}
+            res_evt = sel.get("res_evt") or {}
+            method  = req_evt.get("method", "?")
+            url     = req_evt.get("url", "?")
+            status  = sel.get("status")
+            t_req   = sel.get("t_req", 0)
+            t_res   = sel.get("t_res")
+        else:
+            method = sel.get("method", "?")
+            url    = sel.get("url", "?")
+            status = sel.get("status")
+            t_req  = sel.get("t", 0)
+            t_res  = None
+
+        duration = f"  {t_res - t_req}ms" if t_res is not None else ""
+        status_tag = "err" if _is_err_status(status) else "ok"
+
+        txt.insert(tk.END, f"{method}  ", "method")
+        txt.insert(tk.END, f"{url}\n", "val")
+        txt.insert(tk.END, f"{status or '(pending)'}{duration}\n", status_tag)
+        txt.insert(tk.END, f"{fmt_ms(t_req)}\n\n", "dim")
+        txt.insert(tk.END, RULE, "dim")
+
+        if raw_flow:
+            def _insert_headers(h):
+                if isinstance(h, list):
+                    for item in h:
+                        if isinstance(item, (list, tuple)) and len(item) == 2:
+                            txt.insert(tk.END, f"  {item[0]}: ", "key")
+                            txt.insert(tk.END, f"{item[1]}\n", "val")
+                elif isinstance(h, dict):
+                    for k, v in h.items():
+                        txt.insert(tk.END, f"  {k}: ", "key")
+                        txt.insert(tk.END, f"{v}\n", "val")
+
+            req_obj  = raw_flow.get("request") or {}
+            res_obj  = raw_flow.get("response") or {}
+
+            txt.insert(tk.END, "REQUEST\n", "hdr")
+            req_hdrs = raw_flow.get("request_headers") or req_obj.get("headers")
+            if req_hdrs:
+                _insert_headers(req_hdrs)
+            req_body = raw_flow.get("request_body") or req_obj.get("body") or req_obj.get("content")
+            if req_body:
+                txt.insert(tk.END, "\n" + _format_body(req_body), "body")
+
+            txt.insert(tk.END, "\n" + RULE, "dim")
+            txt.insert(tk.END, "RESPONSE\n", "hdr")
+            res_hdrs = raw_flow.get("response_headers") or res_obj.get("headers")
+            if res_hdrs:
+                _insert_headers(res_hdrs)
+            res_body = raw_flow.get("response_body") or res_obj.get("body") or res_obj.get("content")
+            if res_body:
+                txt.insert(tk.END, "\n" + _format_body(res_body), "body")
+        else:
+            txt.insert(tk.END, "no raw flow data\n\n", "dim")
+            txt.insert(tk.END, "(network.json missing or flow_id not matched)\n", "dim")
+
+        txt.configure(state=tk.DISABLED)
+        popup.focus_set()
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _format_body(body) -> str:
+    if isinstance(body, (dict, list)):
+        try:
+            return json.dumps(body, indent=2, ensure_ascii=False) + "\n"
+        except Exception:
+            return str(body) + "\n"
+    if isinstance(body, str):
+        try:
+            return json.dumps(json.loads(body), indent=2, ensure_ascii=False) + "\n"
+        except Exception:
+            return body + "\n"
+    return str(body) + "\n"
 
 
 # ── entry point ───────────────────────────────────────────────────────────────

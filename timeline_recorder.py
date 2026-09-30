@@ -130,17 +130,20 @@ def _network_events(flows: List[dict]) -> List[dict]:
         url    = flow.get("url", "?")
         status = flow.get("response_status")
 
+        flow_id = flow.get("id")
         if t_req is not None:
             events.append({
-                "t":      t_req,
-                "type":   "network_req",
-                "method": method,
-                "url":    url,
+                "t":       t_req,
+                "type":    "network_req",
+                "flow_id": flow_id,
+                "method":  method,
+                "url":     url,
             })
         if t_resp is not None:
             events.append({
                 "t":           t_resp,
                 "type":        "network_res",
+                "flow_id":     flow_id,
                 "method":      method,
                 "url":         url,
                 "status":      status,
