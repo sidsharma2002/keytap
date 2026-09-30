@@ -522,7 +522,8 @@ class TimelineViewer:
         self.lbl_ev_window   = None
         self._net_card       = None
         self._net_card_key   = None   # tracks what's currently rendered in the card
-        self._txt_window_key = None   # (t_start, t_end, filter) — skip rebuild when same
+        self._txt_window_key = None   # (t_start, t_end, filter, query) — skip rebuild when same
+        self._search_query   = ""
 
         root.title("keytap  |  timeline")
         root.configure(bg=BG)
@@ -608,6 +609,30 @@ class TimelineViewer:
             lbl.pack(side=tk.LEFT, padx=2)
             lbl.bind("<Button-1>", lambda e, k=key: self._set_filter(k))
             self._filter_tabs[key] = lbl
+        tk.Frame(ev_outer, bg=BORDER, height=1).pack(fill=tk.X)
+
+        # search bar
+        search_row = tk.Frame(ev_outer, bg=SIDE, padx=8, pady=5)
+        search_row.pack(fill=tk.X)
+        tk.Label(search_row, text="\u2315", bg=SIDE, fg=DIM,
+                 font=("Menlo", 11)).pack(side=tk.LEFT)
+        self._search_var = tk.StringVar()
+        self._search_entry = tk.Entry(
+            search_row, textvariable=self._search_var,
+            bg=BTN, fg=DIM, insertbackground=FG,
+            relief=tk.FLAT, font=FONT_SM, bd=0,
+        )
+        self._search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+        self._search_placeholder = "search endpoints, logs, actions..."
+        self._search_entry.insert(0, self._search_placeholder)
+        self._search_entry.bind("<FocusIn>",  self._on_search_focus_in)
+        self._search_entry.bind("<FocusOut>", self._on_search_focus_out)
+        self._search_var.trace_add("write", self._on_search_change)
+        self._search_btn_clear = tk.Label(
+            search_row, text="\u00d7", bg=SIDE, fg=DIM,
+            font=("Menlo", 11), cursor="hand2",
+        )
+        self._search_btn_clear.bind("<Button-1>", self._on_search_clear)
         tk.Frame(ev_outer, bg=BORDER, height=1).pack(fill=tk.X)
 
         # inline network card — always packed, empty = zero height
@@ -822,6 +847,36 @@ class TimelineViewer:
         self._ev_filter = key
         self._update_events()
 
+    def _on_search_focus_in(self, _event):
+        if self._search_var.get() == self._search_placeholder:
+            self._search_entry.configure(fg=FG)
+            self._search_var.set("")
+
+    def _on_search_focus_out(self, _event):
+        if not self._search_var.get().strip():
+            self._search_entry.configure(fg=DIM)
+            self._search_var.set(self._search_placeholder)
+
+    def _on_search_change(self, *_):
+        raw = self._search_var.get()
+        q = "" if raw == self._search_placeholder else raw.strip()
+        self._search_query = q
+        # show/hide clear button
+        if q:
+            self._search_btn_clear.pack(side=tk.RIGHT)
+        else:
+            self._search_btn_clear.pack_forget()
+        self._txt_window_key = None  # force full rebuild
+        self._update_events()
+
+    def _on_search_clear(self, _event=None):
+        self._search_entry.configure(fg=DIM)
+        self._search_var.set(self._search_placeholder)
+        self._search_query = ""
+        self._search_btn_clear.pack_forget()
+        self._txt_window_key = None
+        self._update_events()
+
     def _show_net_card(self, flow):
         for w in self._net_card.winfo_children():
             w.destroy()
@@ -972,7 +1027,23 @@ class TimelineViewer:
             if self._ev_filter == "logs":    return t == "log"
             return True
 
-        filtered = [e for e in window if matches(e)]
+        def matches_search(e):
+            q = self._search_query.lower()
+            if not q:
+                return True
+            typ = e.get("type", "")
+            if typ in ("network_req", "network_res"):
+                return (q in (e.get("url") or "").lower() or
+                        q in (e.get("method") or "").lower())
+            if typ == "log":
+                return (q in (e.get("msg") or "").lower() or
+                        q in (e.get("tag") or "").lower())
+            if typ == "action":
+                return (q in (e.get("hint") or "").lower() or
+                        q in (e.get("action_type") or "").lower())
+            return True
+
+        filtered = [e for e in window if matches(e) and matches_search(e)]
 
         sel_ids = set()
         if selected is not None:
@@ -983,7 +1054,7 @@ class TimelineViewer:
                 sel_ids.add(id(selected))
 
         # ── skip full rebuild when only selection/highlight changed ───────────
-        window_key = (t_start, t_end, self._ev_filter)
+        window_key = (t_start, t_end, self._ev_filter, self._search_query)
         if window_key == self._txt_window_key:
             # tag-only update — no delete/reinsert, no flicker
             self.txt.configure(state=tk.NORMAL)
