@@ -49,13 +49,46 @@ fi
 
 # ── Python ────────────────────────────────────────────────────────────────────
 
-PYTHON=$(command -v python3 || true)
+MIN_PY_MAJOR=3
+MIN_PY_MINOR=10
+
+# Prints "major.minor" for the given interpreter, or nothing if it cannot run.
+py_version() {
+    "$1" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || true
+}
+
+py_is_supported() {
+    "$1" -c "import sys; sys.exit(0 if sys.version_info >= ($MIN_PY_MAJOR, $MIN_PY_MINOR) else 1)" 2>/dev/null
+}
+
+# Pick the first interpreter on PATH that is new enough. Newer versioned names go
+# first so a machine with an old default python3 (e.g. macOS 3.9) still works.
+PYTHON=""
+FOUND_OLD=""
+for cand in python3.13 python3.12 python3.11 python3.10 python3 python; do
+    path=$(command -v "$cand" || true)
+    [[ -n "$path" ]] || continue
+    if py_is_supported "$path"; then
+        PYTHON="$path"
+        break
+    fi
+    [[ -n "$FOUND_OLD" ]] || FOUND_OLD="$path ($(py_version "$path"))"
+done
+
 if [[ -z "$PYTHON" ]]; then
-    error "python3 not found. Install it from https://python.org or via Homebrew: brew install python"
+    if [[ -n "$FOUND_OLD" ]]; then
+        error "Python $MIN_PY_MAJOR.$MIN_PY_MINOR or newer is required, but only found: $FOUND_OLD"
+    else
+        error "Python $MIN_PY_MAJOR.$MIN_PY_MINOR or newer is required, but no python3 was found."
+    fi
+    echo "  Install a newer Python, then re-run this script:"
+    echo "    macOS:         brew install python@3.12"
+    echo "    Debian/Ubuntu: sudo apt install python3 python3-pip"
+    echo "    Fedora:        sudo dnf install python3 python3-pip"
+    echo "    Other:         https://www.python.org/downloads/"
     exit 1
 fi
-PY_VER=$("$PYTHON" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-info "Python $PY_VER found at $PYTHON"
+info "Python $(py_version "$PYTHON") found at $PYTHON"
 
 # ── pip install ───────────────────────────────────────────────────────────────
 
@@ -130,7 +163,7 @@ KEYTAP_FUNC=$(cat <<EOF
 
 # keytap — keyboard-driven Android mirror
 keytap() {
-    python3 "$KEYTAP_DIR/keytap.py" "\$@"
+    "$PYTHON" "$KEYTAP_DIR/keytap.py" "\$@"
 }
 EOF
 )
@@ -140,7 +173,7 @@ add_to_shell() {
     if [[ -f "$rc_file" ]]; then
         if grep -q "keytap()" "$rc_file" 2>/dev/null; then
             # Update the path in case repo moved
-            sed -i.bak "/python3.*keytap\.py/c\\    python3 \"$KEYTAP_DIR/keytap.py\" \"\\\$@\"" "$rc_file"
+            sed -i.bak "/python.*keytap\.py/c\\    \"$PYTHON\" \"$KEYTAP_DIR/keytap.py\" \"\\\$@\"" "$rc_file"
             info "Updated keytap path in $rc_file"
         else
             echo "$KEYTAP_FUNC" >> "$rc_file"
