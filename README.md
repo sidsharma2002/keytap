@@ -62,7 +62,7 @@ bash install.sh
 
 - **adb** — `brew install android-platform-tools`
 - **ffmpeg** — `brew install ffmpeg` (optional, used by screenrecord fallback)
-- Python 3.10+
+- Python 3.10+ with tkinter — `brew install python-tk@3.12` (macOS) or `sudo apt install python3-tk` (Debian/Ubuntu)
 
 ### Network capture setup (optional, one-time)
 

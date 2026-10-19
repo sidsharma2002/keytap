@@ -66,30 +66,48 @@ py_is_supported() {
     "$1" -c "import sys; sys.exit(0 if sys.version_info >= ($MIN_PY_MAJOR, $MIN_PY_MINOR) else 1)" 2>/dev/null
 }
 
-# Pick the first interpreter on PATH that is new enough. Newer versioned names go
-# first so a machine with an old default python3 (e.g. macOS 3.9) still works.
+# The command palette is a tkinter window. tkinter ships with the Python build rather
+# than pip, and many Homebrew/Debian Pythons leave it out.
+py_has_tkinter() {
+    "$1" -c "import tkinter" 2>/dev/null
+}
+
+# Pick the first interpreter on PATH that is new enough and has tkinter. Newer versioned
+# names go first so a machine with an old default python3 (e.g. macOS 3.9) still works.
 PYTHON=""
 FOUND_OLD=""
+FOUND_NO_TK=""
 for cand in python3.13 python3.12 python3.11 python3.10 python3 python; do
     path=$(command -v "$cand" || true)
     [[ -n "$path" ]] || continue
-    if py_is_supported "$path"; then
+    if ! py_is_supported "$path"; then
+        [[ -n "$FOUND_OLD" ]] || FOUND_OLD="$path ($(py_version "$path"))"
+    elif ! py_has_tkinter "$path"; then
+        [[ -n "$FOUND_NO_TK" ]] || FOUND_NO_TK="$path ($(py_version "$path"))"
+    else
         PYTHON="$path"
         break
     fi
-    [[ -n "$FOUND_OLD" ]] || FOUND_OLD="$path ($(py_version "$path"))"
 done
 
 if [[ -z "$PYTHON" ]]; then
+    if [[ -n "$FOUND_NO_TK" ]]; then
+        error "Found $FOUND_NO_TK, but it was built without tkinter (needed for the command palette)."
+        echo "  Install Tk for that Python, then re-run this script:"
+        echo "    macOS:         brew install python-tk@$(py_version "${FOUND_NO_TK%% *}")"
+        echo "    Debian/Ubuntu: sudo apt install python3-tk"
+        echo "    Fedora:        sudo dnf install python3-tkinter"
+        exit 1
+    fi
     if [[ -n "$FOUND_OLD" ]]; then
         error "Python $MIN_PY_MAJOR.$MIN_PY_MINOR or newer is required, but only found: $FOUND_OLD"
     else
         error "Python $MIN_PY_MAJOR.$MIN_PY_MINOR or newer is required, but no python3 was found."
     fi
     echo "  Install a newer Python, then re-run this script:"
-    echo "    macOS:         brew install python@3.12"
-    echo "    Debian/Ubuntu: sudo apt install python3 python3-pip"
-    echo "    Fedora:        sudo dnf install python3 python3-pip"
+    echo "    macOS:         brew install python@3.12 python-tk@3.12"
+    echo "    Debian/Ubuntu: sudo apt install python3 python3-pip python3-venv python3-tk"
+    echo "    Fedora:        sudo dnf install python3 python3-pip python3-tkinter"
     echo "    Other:         https://www.python.org/downloads/"
     exit 1
 fi
@@ -99,8 +117,8 @@ info "Python $(py_version "$PYTHON") found at $PYTHON"
 
 # A dedicated venv sidesteps PEP 668 ("externally managed") errors, avoids version
 # clashes with other tools, and means `keytap` always runs the Python it was installed with.
-if [[ -x "$VENV_PY" ]] && ! py_is_supported "$VENV_PY"; then
-    warn "Existing virtualenv at $VENV_DIR uses an unsupported Python — recreating it"
+if [[ -x "$VENV_PY" ]] && { ! py_is_supported "$VENV_PY" || ! py_has_tkinter "$VENV_PY"; }; then
+    warn "Existing virtualenv at $VENV_DIR uses an unsupported Python (or one without tkinter) — recreating it"
     rm -rf "$VENV_DIR"
 fi
 
@@ -120,17 +138,49 @@ fi
 # Console scripts such as mitmdump live here.
 export PATH="$VENV_DIR/bin:$PATH"
 
-info "Installing Python dependencies..."
+LOG_FILE="${KEYTAP_LOG:-$(dirname "$VENV_DIR")/install.log}"
+{ echo "=== keytap install $(date) ==="; echo "python: $PYTHON ($(py_version "$PYTHON"))"; } >> "$LOG_FILE"
 
-PKGS=("av>=18.0" "numpy>=1.24" "Pillow>=9.0" "pygame>=2.0" "uiautomator2>=2.0" "mitmproxy>=10.0" "perfetto>=0.5")
+# pip install into the venv with output going to the log; on failure show the tail of it.
+pip_install() {
+    local start
+    start=$(wc -l < "$LOG_FILE")
+    if "$VENV_PY" -m pip install "$@" >> "$LOG_FILE" 2>&1; then
+        return 0
+    fi
+    echo "  ---- last lines of pip output ----"
+    tail -n +"$((start + 1))" "$LOG_FILE" | tail -n 25 | cut -c1-200 | sed 's/^/  | /'
+    echo "  ----------------------------------"
+    return 1
+}
 
-"$VENV_PY" -m pip install --quiet --upgrade pip || warn "Could not upgrade pip; continuing with the bundled one"
-if ! "$VENV_PY" -m pip install "${PKGS[@]}"; then
-    error "Installing Python dependencies failed (see the pip output above)."
+# Needed for keytap to run at all: a failure here stops the install.
+CORE_PKGS=("av>=18.0" "numpy>=1.24" "Pillow>=9.0" "pygame>=2.0" "uiautomator2>=2.0")
+# Each only enables one feature (imported lazily), so a failure only disables that feature.
+OPTIONAL_PKGS=("mitmproxy>=10.0|network capture and replay" "perfetto>=0.5|the profiler")
+
+info "Installing Python dependencies (full log: $LOG_FILE)..."
+pip_install --upgrade pip || warn "Could not upgrade pip; continuing with the bundled one"
+
+if ! pip_install "${CORE_PKGS[@]}"; then
+    error "Installing the core Python dependencies failed."
+    echo "  Common causes: no network access, or no pre-built wheel for Python $(py_version "$PYTHON") on this platform."
+    echo "  Try another Python version (3.11 or 3.12 have the widest wheel support), then re-run. Log: $LOG_FILE"
     exit 1
 fi
+info "Core dependencies installed."
 
-info "Python dependencies installed."
+SKIPPED_OPTIONAL=()
+for entry in "${OPTIONAL_PKGS[@]}"; do
+    pkg="${entry%%|*}"
+    feature="${entry#*|}"
+    if pip_install "$pkg"; then
+        info "Installed optional $pkg"
+    else
+        warn "Could not install $pkg — $feature will not work. See $LOG_FILE"
+        SKIPPED_OPTIONAL+=("$pkg")
+    fi
+done
 
 # ── System tools ──────────────────────────────────────────────────────────────
 
@@ -149,7 +199,9 @@ check_tool ffmpeg "Install ffmpeg (optional, used by screenrecord fallback): bre
 # ── mitmproxy CA cert (required for network capture) ──────────────────────────
 
 MITM_CERT="$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
-if [[ ! -f "$MITM_CERT" ]]; then
+if ! command -v mitmdump &>/dev/null; then
+    warn "mitmproxy is not installed, skipping the network-capture certificate setup."
+elif [[ ! -f "$MITM_CERT" ]]; then
     info "Generating mitmproxy CA certificate..."
     timeout 2 mitmdump --quiet 2>/dev/null || true
     if [[ -f "$MITM_CERT" ]]; then
@@ -223,6 +275,20 @@ if [[ $ADDED -eq 0 ]]; then
 fi
 
 install_skill
+
+# ── Smoke test ────────────────────────────────────────────────────────────────
+
+info "Checking the install..."
+SMOKE_OK=1
+SMOKE_OUT=$(cd "$KEYTAP_DIR" && "$VENV_PY" -m keytap.smoke 2>&1) || SMOKE_OK=0
+echo "$SMOKE_OUT" | tee -a "$LOG_FILE"
+if [[ $SMOKE_OK -eq 0 ]]; then
+    error "The install finished, but keytap cannot start (see the FAIL lines above). Log: $LOG_FILE"
+    exit 1
+fi
+if [[ ${#SKIPPED_OPTIONAL[@]} -gt 0 ]]; then
+    warn "Skipped optional packages: ${SKIPPED_OPTIONAL[*]}"
+fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 
