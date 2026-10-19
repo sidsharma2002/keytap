@@ -14,6 +14,10 @@
 set -euo pipefail
 
 KEYTAP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# keytap runs from its own virtualenv so it never touches (or depends on) the system
+# Python. Override with KEYTAP_VENV; keytap/_venv.py reads the same variable.
+VENV_DIR="${KEYTAP_VENV:-$HOME/.keytap/venv}"
+VENV_PY="$VENV_DIR/bin/python"
 YELLOW='\033[1;33m'
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -28,7 +32,8 @@ error() { echo -e "${RED}[keytap]${NC} $*"; }
 # Copies every folder in skills/ to ~/.claude/skills and writes this keytap folder's path into
 # it, so Claude can find replay.py when it is not started inside the keytap folder.
 install_skill() {
-    local src name dst
+    local src name dst skill_py
+    if [[ -x "$VENV_PY" ]]; then skill_py="$VENV_PY"; else skill_py="$(command -v python3 || echo python3)"; fi
     for src in "$KEYTAP_DIR"/skills/*/; do
         [[ -f "$src/SKILL.md" ]] || continue
         name="$(basename "$src")"
@@ -36,7 +41,7 @@ install_skill() {
         rm -rf "$dst"
         mkdir -p "$dst"
         cp -R "$src." "$dst/"
-        find "$dst" -name '*.md' -exec sed -i.bak "s|__KEYTAP_DIR__|$KEYTAP_DIR|g" {} +
+        find "$dst" -name '*.md' -exec sed -i.bak -e "s|__KEYTAP_DIR__|$KEYTAP_DIR|g" -e "s|__KEYTAP_PYTHON__|$skill_py|g" {} +
         find "$dst" -name '*.bak' -delete
         info "Installed Claude skill $name to $dst"
     done
@@ -90,22 +95,39 @@ if [[ -z "$PYTHON" ]]; then
 fi
 info "Python $(py_version "$PYTHON") found at $PYTHON"
 
-# ── pip install ───────────────────────────────────────────────────────────────
+# ── virtualenv + pip install ──────────────────────────────────────────────────
+
+# A dedicated venv sidesteps PEP 668 ("externally managed") errors, avoids version
+# clashes with other tools, and means `keytap` always runs the Python it was installed with.
+if [[ -x "$VENV_PY" ]] && ! py_is_supported "$VENV_PY"; then
+    warn "Existing virtualenv at $VENV_DIR uses an unsupported Python — recreating it"
+    rm -rf "$VENV_DIR"
+fi
+
+if [[ ! -x "$VENV_PY" ]]; then
+    info "Creating virtualenv at $VENV_DIR..."
+    mkdir -p "$(dirname "$VENV_DIR")"
+    if ! "$PYTHON" -m venv "$VENV_DIR"; then
+        rm -rf "$VENV_DIR"
+        error "Could not create a virtualenv with $PYTHON."
+        echo "  On Debian/Ubuntu install the venv module first: sudo apt install python3-venv"
+        exit 1
+    fi
+else
+    info "Using existing virtualenv at $VENV_DIR"
+fi
+
+# Console scripts such as mitmdump live here.
+export PATH="$VENV_DIR/bin:$PATH"
 
 info "Installing Python dependencies..."
 
 PKGS=("av>=18.0" "numpy>=1.24" "Pillow>=9.0" "pygame>=2.0" "uiautomator2>=2.0" "mitmproxy>=10.0" "perfetto>=0.5")
 
-# Try plain install first; if PEP 668 blocks it (Homebrew/system Python),
-# retry with --user --break-system-packages which installs to ~/Library/Python.
-if ! "$PYTHON" -m pip install --quiet "${PKGS[@]}" 2>/tmp/keytap_pip_err; then
-    if grep -q "externally-managed" /tmp/keytap_pip_err; then
-        info "Externally managed Python — installing to user site-packages"
-        "$PYTHON" -m pip install --quiet --user --break-system-packages "${PKGS[@]}"
-    else
-        cat /tmp/keytap_pip_err
-        exit 1
-    fi
+"$VENV_PY" -m pip install --quiet --upgrade pip || warn "Could not upgrade pip; continuing with the bundled one"
+if ! "$VENV_PY" -m pip install "${PKGS[@]}"; then
+    error "Installing Python dependencies failed (see the pip output above)."
+    exit 1
 fi
 
 info "Python dependencies installed."
@@ -163,7 +185,7 @@ KEYTAP_FUNC=$(cat <<EOF
 
 # keytap — keyboard-driven Android mirror
 keytap() {
-    "$PYTHON" "$KEYTAP_DIR/keytap.py" "\$@"
+    "$VENV_PY" "$KEYTAP_DIR/keytap.py" "\$@"
 }
 EOF
 )
@@ -173,7 +195,7 @@ add_to_shell() {
     if [[ -f "$rc_file" ]]; then
         if grep -q "keytap()" "$rc_file" 2>/dev/null; then
             # Update the path in case repo moved
-            sed -i.bak "/python.*keytap\.py/c\\    \"$PYTHON\" \"$KEYTAP_DIR/keytap.py\" \"\\\$@\"" "$rc_file"
+            sed -i.bak "/python.*keytap\.py/c\\    \"$VENV_PY\" \"$KEYTAP_DIR/keytap.py\" \"\\\$@\"" "$rc_file"
             info "Updated keytap path in $rc_file"
         else
             echo "$KEYTAP_FUNC" >> "$rc_file"

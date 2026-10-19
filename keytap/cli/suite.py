@@ -1,4 +1,4 @@
-#!/opt/homebrew/bin/python3
+#!/usr/bin/env python3
 """
 Test suites made of recordings: reusable flows (login), tests with assertions, one command to run
 them all, results in folders. A suite is a folder you commit next to the app.

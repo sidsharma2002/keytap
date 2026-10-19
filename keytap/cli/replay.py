@@ -1,4 +1,4 @@
-#!/opt/homebrew/bin/python3
+#!/usr/bin/env python3
 """
 Headless replay of a recording, for nightly smoke runs. No window, no keyboard.
 
