@@ -418,8 +418,8 @@ class KeyTap:
 
     def _read_clipboard(self):
         try:
-            return subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=1).stdout
-        except Exception:
+            return self.root.clipboard_get()
+        except tk.TclError:  # empty clipboard or non-text content
             return ""
 
     def _open_palette(self):
@@ -638,7 +638,7 @@ class KeyTap:
             pretty = json.dumps(json.loads(raw_json), indent=2)
         except Exception:
             pretty = raw_json
-        tmppath = "/tmp/keytap_litmus_detail.json"
+        tmppath = os.path.join(tempfile.gettempdir(), "keytap_litmus_detail.json")
         with open(tmppath, "w") as f:
             f.write(pretty)
         subprocess.Popen([

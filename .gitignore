@@ -16,4 +16,3 @@ build/
 .vscode/
 *.swp
 *.swo
-/tmp/keytap_stream.fifo
