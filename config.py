@@ -1,6 +1,7 @@
 import argparse
 import os
 import shutil
+import tempfile
 
 
 def _find_adb():
@@ -22,7 +23,7 @@ def _find_adb():
 ADB_PATH    = _find_adb()
 CURSOR_MODE = True   # True = arrow-key cursor; False = 2-letter label typing
 CURSOR_JUMP = 5      # Shift+arrow jumps this many cells at once
-FIFO_PATH   = "/tmp/keytap_stream.fifo"
+FIFO_PATH   = os.path.join(tempfile.gettempdir(), "keytap_stream.fifo")
 HAS_SCRCPY  = shutil.which("scrcpy") is not None
 HAS_FFMPEG  = shutil.which("ffmpeg") is not None
 

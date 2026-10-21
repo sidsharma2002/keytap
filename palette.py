@@ -1,6 +1,7 @@
 import collections
 import re
 import subprocess
+import sys
 import threading
 import tkinter as tk
 
@@ -105,7 +106,9 @@ class CommandPalette:
         self._listbox.bind("<Double-Button-1>", self._select)
         self._listbox.bind("<<ListboxSelect>>", self._on_listbox_select)
         self.win.bind("<Escape>", self._on_esc)
-        self.win.bind("<Command-r>", self._on_ctrl_r)
+        self.win.bind("<Control-r>", self._on_ctrl_r)
+        if sys.platform == "darwin":
+            self.win.bind("<Command-r>", self._on_ctrl_r)
 
     def _on_query_change(self):
         if self._state == "viewer":

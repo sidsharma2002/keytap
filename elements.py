@@ -111,7 +111,8 @@ def dump_hierarchy_tree(serial=None):
         xml_str = xml_raw if isinstance(xml_raw, str) else xml_raw.decode()
     else:
         import subprocess
-        cmd = ['adb']
+        from config import ADB_PATH
+        cmd = [ADB_PATH]
         if serial:
             cmd += ['-s', serial]
         cmd += ['shell', 'uiautomator', 'dump', '/dev/stdout']
